@@ -177,7 +177,7 @@ func (b *BeatsMonitor) MonitoringConfig(
 	outputOtelSupportedErr := verifyOutputOtelSupported(outputCfg)
 	monitoringRuntime := component.RuntimeManager(b.config.C.RuntimeManager)
 	if outputOtelSupportedErr != nil {
-		b.logger.Warnf("otel runtime is not supported for monitoring output, switching to process runtime, reason: %v", outputOtelSupportedErr)
+		b.logger.Infof("otel runtime is not supported for monitoring output, switching to process runtime, reason: %v", outputOtelSupportedErr)
 		monitoringRuntime = monitoringCfg.ProcessRuntimeManager
 	}
 	outputOtelSupported := outputOtelSupportedErr == nil
@@ -477,8 +477,9 @@ func (b *BeatsMonitor) injectMetricsInput(
 	beatsStreams := b.getBeatsStreams(componentInfos)
 	httpStreams := b.getHttpStreams(componentInfos)
 
-	inputs := []any{
-		map[string]any{
+	inputs := []any{}
+	if len(beatsStreams) > 0 {
+		inputs = append(inputs, map[string]any{
 			idKey:        fmt.Sprintf("%s-beats", monitoringMetricsUnitID),
 			"name":       fmt.Sprintf("%s-beats", monitoringMetricsUnitID),
 			"type":       "beat/metrics",
@@ -488,8 +489,10 @@ func (b *BeatsMonitor) injectMetricsInput(
 			},
 			"streams":               beatsStreams,
 			"_runtime_experimental": string(monitoringRuntime),
-		},
-		map[string]any{
+		})
+	}
+	if len(httpStreams) > 0 {
+		inputs = append(inputs, map[string]any{
 			idKey:        fmt.Sprintf("%s-agent", monitoringMetricsUnitID),
 			"name":       fmt.Sprintf("%s-agent", monitoringMetricsUnitID),
 			"type":       "http/metrics",
@@ -499,7 +502,7 @@ func (b *BeatsMonitor) injectMetricsInput(
 			},
 			"streams":               httpStreams,
 			"_runtime_experimental": string(monitoringRuntime),
-		},
+		})
 	}
 
 	// add system/process metrics for services that can't be monitored via json/beats metrics
@@ -664,35 +667,38 @@ func (b *BeatsMonitor) getHttpStreams(
 		endpoints := []any{PrefixedEndpoint(monitoringhelpers.BeatsMonitoringEndpoint(compInfo.ID))}
 		name := sanitizeName(binaryName)
 
-		// Do not create http streams if runtime-manager is otel and binary is of beat type
-		if compInfo.RuntimeManager != component.OtelRuntimeManager || !strings.HasSuffix(binaryName, "beat") {
-			httpStream := map[string]any{
-				idKey: fmt.Sprintf("%s-%s-1", monitoringMetricsUnitID, name),
-				"data_stream": map[string]any{
-					"type":      "metrics",
-					"dataset":   dataset,
-					"namespace": monitoringNamespace,
-				},
-				"metricsets": []any{"json"},
-				"hosts":      endpoints,
-				"path":       "/stats",
-				"namespace":  "agent",
-				"period":     metricsCollectionIntervalString,
-				"index":      indexName,
-				"processors": processorsForHttpStream(binaryName, compInfo.ID, dataset, b.agentInfo, compInfo.RuntimeManager),
-			}
-			if failureThreshold != nil {
-				httpStream[failureThresholdKey] = *failureThreshold
-			}
-			httpStreams = append(httpStreams, httpStream)
+		// OTel-managed components don't expose the HTTP stats endpoint, so skip all
+		// HTTP scraping streams for them. Their metrics flow through the elasticmonitoring
+		// receiver via OTel internal telemetry instead.
+		if compInfo.RuntimeManager == component.OtelRuntimeManager {
+			continue
 		}
+		httpStream := map[string]any{
+			idKey: fmt.Sprintf("%s-%s-1", monitoringMetricsUnitID, name),
+			"data_stream": map[string]any{
+				"type":      "metrics",
+				"dataset":   dataset,
+				"namespace": monitoringNamespace,
+			},
+			"metricsets": []any{"json"},
+			"hosts":      endpoints,
+			"path":       "/stats",
+			"namespace":  "agent",
+			"period":     metricsCollectionIntervalString,
+			"index":      indexName,
+			"processors": processorsForHttpStream(binaryName, compInfo.ID, dataset, b.agentInfo, compInfo.RuntimeManager),
+		}
+		if failureThreshold != nil {
+			httpStream[failureThresholdKey] = *failureThreshold
+		}
+		httpStreams = append(httpStreams, httpStream)
 		// specifically for filebeat, we include input metrics
 		if strings.EqualFold(name, "filebeat") {
 			fbDataStreamName := "filebeat_input"
 			fbDataset := fmt.Sprintf("elastic_agent.%s", fbDataStreamName)
 			fbIndexName := fmt.Sprintf("metrics-elastic_agent.%s-%s", fbDataStreamName, monitoringNamespace)
 			fbStream := map[string]any{
-				idKey: fmt.Sprintf("%s-%s-1", monitoringMetricsUnitID, name),
+				idKey: fmt.Sprintf("%s-%s-1-input", monitoringMetricsUnitID, name),
 				"data_stream": map[string]any{
 					"type":      "metrics",
 					"dataset":   fbDataset,
@@ -728,6 +734,13 @@ func (b *BeatsMonitor) getBeatsStreams(
 	for _, compInfo := range componentInfos {
 		binaryName := compInfo.BinaryName
 		if !isSupportedBeatsBinary(binaryName) {
+			continue
+		}
+
+		// OTel-managed components don't expose the HTTP stats endpoint (http.enabled is not
+		// set), so skip generating beat.stats scraping streams for them. Their metrics are
+		// instead collected via the elasticmonitoring receiver through OTel internal telemetry.
+		if compInfo.RuntimeManager == component.OtelRuntimeManager {
 			continue
 		}
 
@@ -863,10 +876,7 @@ func processorsForServiceComponentFilestream(compInfo componentInfo, dataset str
 // processorsForProcessMetrics returns processors used for process metrics.
 func processorsForProcessMetrics(binaryName, unitID, namespace, dataset string, agentInfo info.Agent) []any {
 	return []any{
-		addDataStreamFieldsProcessor(dataset, namespace),
-		addEventFieldsProcessor(dataset),
-		addElasticAgentFieldsProcessor(binaryName, agentInfo),
-		addAgentFieldsProcessor(agentInfo.AgentID()),
+		addProcessName(binaryName),
 		addComponentFieldsProcessor(binaryName, unitID),
 	}
 }
@@ -878,10 +888,7 @@ func processorsForBeatsStream(
 	runtimeManager component.RuntimeManager,
 ) []any {
 	processors := []any{
-		addDataStreamFieldsProcessor(dataset, namespace),
-		addEventFieldsProcessor(dataset),
-		addElasticAgentFieldsProcessor(binaryName, agentInfo),
-		addAgentFieldsProcessor(agentInfo.AgentID()),
+		addProcessName(binaryName),
 		addComponentFieldsProcessor(binaryName, unitID),
 	}
 	if runtimeManager == component.OtelRuntimeManager { // we don't want process metrics for beats receivers
@@ -911,8 +918,7 @@ func processorsForHttpStream(binaryName, unitID, dataset string, agentInfo info.
 	}
 	return []any{
 		addEventFieldsProcessor(dataset),
-		addElasticAgentFieldsProcessor(sanitizedName, agentInfo),
-		addAgentFieldsProcessor(agentInfo.AgentID()),
+		addProcessName(sanitizedName),
 		addCopyFieldsProcessor(httpCopyRules(), true, false),
 		dropFieldsProcessor(fieldsToDrop, true),
 		addComponentFieldsProcessor(binaryName, unitID),
@@ -922,40 +928,10 @@ func processorsForHttpStream(binaryName, unitID, dataset string, agentInfo info.
 // processorsForAgentHttpStream returns the processors used for the agent metric stream in the beats input.
 func processorsForAgentHttpStream(binaryName, processName, unitID, namespace, dataset string, agentInfo info.Agent) []any {
 	return []any{
-		addDataStreamFieldsProcessor(dataset, namespace),
-		addEventFieldsProcessor(dataset),
-		addElasticAgentFieldsProcessor(processName, agentInfo),
-		addAgentFieldsProcessor(agentInfo.AgentID()),
+		addProcessName(processName),
 		addCopyFieldsProcessor(httpCopyRules(), true, false),
 		dropFieldsProcessor([]any{"http"}, true),
 		addComponentFieldsProcessor(binaryName, unitID),
-	}
-}
-
-// addElasticAgentFieldsProcessor returns a processor definition that adds agent information in an `elastic_agent` field.
-func addElasticAgentFieldsProcessor(processName string, agentInfo info.Agent) map[string]any {
-	return map[string]any{
-		"add_fields": map[string]any{
-			"target": "elastic_agent",
-			"fields": map[string]any{
-				"id":       agentInfo.AgentID(),
-				"version":  agentInfo.Version(),
-				"snapshot": agentInfo.Snapshot(),
-				"process":  processName,
-			},
-		},
-	}
-}
-
-// addAgentFieldsProcessor returns a processor definition that adds the agent ID under an `agent.id` field.
-func addAgentFieldsProcessor(agentID string) map[string]any {
-	return map[string]any{
-		"add_fields": map[string]any{
-			"target": "agent",
-			"fields": map[string]any{
-				"id": agentID,
-			},
-		},
 	}
 }
 
@@ -967,20 +943,6 @@ func addComponentFieldsProcessor(binaryName, unitID string) map[string]any {
 			"fields": map[string]any{
 				"id":     unitID,
 				"binary": binaryName,
-			},
-		},
-	}
-}
-
-// addDataStreamFieldsProcessor returns a processor definition that adds datastream information.
-func addDataStreamFieldsProcessor(dataset, namespace string) map[string]any {
-	return map[string]any{
-		"add_fields": map[string]any{
-			"target": "data_stream",
-			"fields": map[string]any{
-				"type":      "metrics",
-				"dataset":   dataset,
-				"namespace": namespace,
 			},
 		},
 	}
@@ -1323,6 +1285,12 @@ func httpCopyRules() []any {
 			"from": "http.filebeat_input",
 			"to":   "filebeat_input",
 		},
+
+		// System CPU core count
+		map[string]any{
+			"from": "http.agent.system.cpu.cores",
+			"to":   "system.cpu.cores",
+		},
 	}
 
 	return fromToMap
@@ -1394,4 +1362,15 @@ func monitoringDrop(path string) (drop string) {
 	}
 
 	return path
+}
+
+func addProcessName(processName string) map[string]any {
+	return map[string]any{
+		"add_fields": map[string]any{
+			"target": "elastic_agent",
+			"fields": map[string]any{
+				"process": processName,
+			},
+		},
+	}
 }

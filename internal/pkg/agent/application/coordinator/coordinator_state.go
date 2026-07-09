@@ -17,10 +17,10 @@ import (
 	"github.com/elastic/elastic-agent-client/v7/pkg/client"
 	"github.com/elastic/elastic-agent-libs/logp"
 
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/details"
 	"github.com/elastic/elastic-agent/internal/pkg/otel/translate"
 	"github.com/elastic/elastic-agent/pkg/component/runtime"
 	agentclient "github.com/elastic/elastic-agent/pkg/control/v2/client"
+	"github.com/elastic/elastic-agent/pkg/upgrade/details"
 )
 
 // State provides the current state of the coordinator along with all the current states of components and units.
@@ -115,11 +115,11 @@ func (c *Coordinator) setConfigError(err error) {
 	c.stateNeedsRefresh = true
 }
 
-// setComponentGenError updates the error state for generating a component
+// setComponentModelError updates the error state for generating a component
 // model from an AST and variables.
 // Called on the main Coordinator goroutine.
-func (c *Coordinator) setComponentGenError(err error) {
-	c.componentGenErr = err
+func (c *Coordinator) setComponentModelError(err error) {
+	c.componentModelErr = err
 	c.stateNeedsRefresh = true
 }
 
@@ -198,6 +198,8 @@ func (c *Coordinator) applyComponentState(state runtime.ComponentComponentState)
 				c.logger.Warnf("failed to remove workdir for component %s: %v", state.Component.ID, err)
 			}
 		}
+		// Check if a deferred manager update was waiting for this component to stop.
+		c.checkPendingManagerUpdate(state.Component.ID)
 	}
 
 	c.stateNeedsRefresh = true
@@ -234,9 +236,9 @@ func (c *Coordinator) generateReportableState() (s State) {
 	} else if c.configErr != nil {
 		s.State = agentclient.Failed
 		s.Message = fmt.Sprintf("Invalid policy: %s", c.configErr.Error())
-	} else if c.componentGenErr != nil {
+	} else if c.componentModelErr != nil {
 		s.State = agentclient.Failed
-		s.Message = fmt.Sprintf("Invalid component model: %s", c.componentGenErr.Error())
+		s.Message = fmt.Sprintf("Invalid component model: %s", c.componentModelErr.Error())
 	} else if c.runtimeUpdateErr != nil {
 		s.State = agentclient.Failed
 		s.Message = fmt.Sprintf("Runtime update failed: %s", c.runtimeUpdateErr.Error())

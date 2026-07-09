@@ -7,7 +7,6 @@
 package ess
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -28,6 +27,12 @@ func TestStandaloneUpgrade(t *testing.T) {
 		Group: integration.StandaloneUpgrade,
 		Local: false, // requires Agent installation
 		Sudo:  true,  // requires Agent installation
+		// Pre-9.3 elastic-agent releases do not have "windows-binary-arm64" in
+		// their internal/pkg/agent/application/upgrade/artifact packageArchMap
+		// (added by PR #11673), so they cannot fetch the windows/arm64 upgrade
+		// artifact. Until the start-version list excludes pre-9.3, skip this
+		// matrix entry on windows/arm64.
+		SkipOS: []define.OS{{Type: define.Windows, Arch: define.ARM64}},
 	})
 
 	versionList, err := upgradetest.GetUpgradableVersions()
@@ -52,7 +57,7 @@ func TestStandaloneUpgrade(t *testing.T) {
 }
 
 func testStandaloneUpgrade(t *testing.T, startVersion *version.ParsedSemVer, endVersion string, fetcher atesting.Fetcher, upgradeOpts ...upgradetest.UpgradeOpt) {
-	ctx, cancel := testcontext.WithDeadline(t, context.Background(), time.Now().Add(10*time.Minute))
+	ctx, cancel := testcontext.WithDeadline(t, t.Context(), time.Now().Add(10*time.Minute))
 	defer cancel()
 
 	startFixture, err := atesting.NewFixture(

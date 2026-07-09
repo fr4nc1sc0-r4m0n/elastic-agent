@@ -5,6 +5,7 @@
 package fleetapi
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,9 +17,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/info"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
 	"github.com/elastic/elastic-agent/internal/pkg/fleetapi/client"
 	"github.com/elastic/elastic-agent/internal/pkg/remote"
+	"github.com/elastic/elastic-agent/pkg/ecsmeta"
+	pkgfleetapi "github.com/elastic/elastic-agent/pkg/fleetapi"
 )
 
 type agentinfo struct{}
@@ -30,6 +33,7 @@ func TestCheckin(t *testing.T) {
 	const requestDelay = time.Millisecond
 	ctx := context.Background()
 	agentInfo := &agentinfo{}
+	defaultCompression := configuration.DefaultFleetCheckin().GetCompression()
 
 	t.Run("Propagate any errors from the server", withServerWithAuthClient(
 		func(t *testing.T) *http.ServeMux {
@@ -48,9 +52,9 @@ func TestCheckin(t *testing.T) {
 			return mux
 		}, withAPIKey,
 		func(t *testing.T, client client.Sender) {
-			cmd := NewCheckinCmd(agentInfo, client)
+			cmd := pkgfleetapi.NewCheckinCmd(agentInfo, client, defaultCompression)
 
-			request := CheckinRequest{}
+			request := pkgfleetapi.CheckinRequest{}
 
 			_, took, err := cmd.Execute(ctx, &request)
 			require.Error(t, err)
@@ -99,18 +103,20 @@ func TestCheckin(t *testing.T) {
 			return mux
 		}, withAPIKey,
 		func(t *testing.T, client client.Sender) {
-			cmd := NewCheckinCmd(agentInfo, client)
+			cmd := pkgfleetapi.NewCheckinCmd(agentInfo, client, defaultCompression)
 
-			request := CheckinRequest{}
+			request := pkgfleetapi.CheckinRequest{}
 
 			r, _, err := cmd.Execute(ctx, &request)
 			require.NoError(t, err)
 
-			require.Equal(t, 1, len(r.Actions))
+			var actions pkgfleetapi.Actions
+			require.NoError(t, json.Unmarshal(r.Actions, &actions))
+			require.Equal(t, 1, len(actions))
 
 			// ActionPolicyChange
-			require.Equal(t, "id1", r.Actions[0].ID())
-			require.Equal(t, "POLICY_CHANGE", r.Actions[0].Type())
+			require.Equal(t, "id1", actions[0].ID())
+			require.Equal(t, "POLICY_CHANGE", actions[0].Type())
 		},
 	))
 
@@ -160,23 +166,25 @@ func TestCheckin(t *testing.T) {
 			return mux
 		}, withAPIKey,
 		func(t *testing.T, client client.Sender) {
-			cmd := NewCheckinCmd(agentInfo, client)
+			cmd := pkgfleetapi.NewCheckinCmd(agentInfo, client, defaultCompression)
 
-			request := CheckinRequest{}
+			request := pkgfleetapi.CheckinRequest{}
 
 			r, _, err := cmd.Execute(ctx, &request)
 			require.NoError(t, err)
 
-			require.Equal(t, 2, len(r.Actions))
+			var actions pkgfleetapi.Actions
+			require.NoError(t, json.Unmarshal(r.Actions, &actions))
+			require.Equal(t, 2, len(actions))
 
 			// ActionPolicyChange
-			require.Equal(t, "id1", r.Actions[0].ID())
-			require.Equal(t, "POLICY_CHANGE", r.Actions[0].Type())
+			require.Equal(t, "id1", actions[0].ID())
+			require.Equal(t, "POLICY_CHANGE", actions[0].Type())
 
 			// UnknownAction
-			require.Equal(t, "id2", r.Actions[1].ID())
-			require.Equal(t, "UNKNOWN", r.Actions[1].Type())
-			require.Equal(t, "WHAT_TO_DO_WITH_IT", r.Actions[1].(*ActionUnknown).OriginalType)
+			require.Equal(t, "id2", actions[1].ID())
+			require.Equal(t, "UNKNOWN", actions[1].Type())
+			require.Equal(t, "WHAT_TO_DO_WITH_IT", actions[1].(*pkgfleetapi.ActionUnknown).OriginalType)
 		},
 	))
 
@@ -192,14 +200,16 @@ func TestCheckin(t *testing.T) {
 			return mux
 		}, withAPIKey,
 		func(t *testing.T, client client.Sender) {
-			cmd := NewCheckinCmd(agentInfo, client)
+			cmd := pkgfleetapi.NewCheckinCmd(agentInfo, client, defaultCompression)
 
-			request := CheckinRequest{}
+			request := pkgfleetapi.CheckinRequest{}
 
 			r, _, err := cmd.Execute(ctx, &request)
 			require.NoError(t, err)
 
-			require.Equal(t, 0, len(r.Actions))
+			var actions pkgfleetapi.Actions
+			require.NoError(t, json.Unmarshal(r.Actions, &actions))
+			require.Equal(t, 0, len(actions))
 		},
 	))
 
@@ -210,13 +220,13 @@ func TestCheckin(t *testing.T) {
 			path := fmt.Sprintf("/api/fleet/agents/%s/checkin", agentInfo.AgentID())
 			mux.HandleFunc(path, authHandler(func(w http.ResponseWriter, r *http.Request) {
 				type Request struct {
-					Metadata *info.ECSMeta `json:"local_metadata"`
+					Metadata *ecsmeta.ECSMeta `json:"local_metadata"`
 				}
 
 				var req *Request
 
-				content, err := io.ReadAll(r.Body)
-				assert.NoError(t, err)
+				content, err := readMaybeCompressedCheckinBody(r)
+				require.NoError(t, err)
 				assert.NoError(t, json.Unmarshal(content, &req))
 				assert.Equal(t, "linux", req.Metadata.OS.Name)
 
@@ -226,14 +236,16 @@ func TestCheckin(t *testing.T) {
 			return mux
 		}, withAPIKey,
 		func(t *testing.T, client client.Sender) {
-			cmd := NewCheckinCmd(agentInfo, client)
+			cmd := pkgfleetapi.NewCheckinCmd(agentInfo, client, defaultCompression)
 
-			request := CheckinRequest{Metadata: testMetadata()}
+			request := pkgfleetapi.CheckinRequest{Metadata: testMetadata()}
 
 			r, _, err := cmd.Execute(ctx, &request)
 			require.NoError(t, err)
 
-			require.Equal(t, 0, len(r.Actions))
+			var actions pkgfleetapi.Actions
+			require.NoError(t, json.Unmarshal(r.Actions, &actions))
+			require.Equal(t, 0, len(actions))
 		},
 	))
 
@@ -244,13 +256,13 @@ func TestCheckin(t *testing.T) {
 			path := fmt.Sprintf("/api/fleet/agents/%s/checkin", agentInfo.AgentID())
 			mux.HandleFunc(path, authHandler(func(w http.ResponseWriter, r *http.Request) {
 				type Request struct {
-					Metadata *info.ECSMeta `json:"local_metadata"`
+					Metadata *ecsmeta.ECSMeta `json:"local_metadata"`
 				}
 
 				var req *Request
 
-				content, err := io.ReadAll(r.Body)
-				assert.NoError(t, err)
+				content, err := readMaybeCompressedCheckinBody(r)
+				require.NoError(t, err)
 				assert.NoError(t, json.Unmarshal(content, &req))
 				assert.Nil(t, req.Metadata)
 
@@ -260,14 +272,16 @@ func TestCheckin(t *testing.T) {
 			return mux
 		}, withAPIKey,
 		func(t *testing.T, client client.Sender) {
-			cmd := NewCheckinCmd(agentInfo, client)
+			cmd := pkgfleetapi.NewCheckinCmd(agentInfo, client, defaultCompression)
 
-			request := CheckinRequest{}
+			request := pkgfleetapi.CheckinRequest{}
 
 			r, _, err := cmd.Execute(ctx, &request)
 			require.NoError(t, err)
 
-			require.Equal(t, 0, len(r.Actions))
+			var actions pkgfleetapi.Actions
+			require.NoError(t, json.Unmarshal(r.Actions, &actions))
+			require.Equal(t, 0, len(actions))
 		},
 	))
 
@@ -278,13 +292,13 @@ func TestCheckin(t *testing.T) {
 			path := fmt.Sprintf("/api/fleet/agents/%s/checkin", agentInfo.AgentID())
 			mux.HandleFunc(path, authHandler(func(w http.ResponseWriter, r *http.Request) {
 				type Request struct {
-					Metadata *info.ECSMeta `json:"local_metadata"`
+					Metadata *ecsmeta.ECSMeta `json:"local_metadata"`
 				}
 
 				var req *Request
 
-				content, err := io.ReadAll(r.Body)
-				assert.NoError(t, err)
+				content, err := readMaybeCompressedCheckinBody(r)
+				require.NoError(t, err)
 				assert.NoError(t, json.Unmarshal(content, &req))
 				assert.Nil(t, req.Metadata)
 
@@ -299,14 +313,16 @@ func TestCheckin(t *testing.T) {
 			return mux
 		}, withAPIKey,
 		func(t *testing.T, client client.Sender) {
-			cmd := NewCheckinCmd(agentInfo, client)
+			cmd := pkgfleetapi.NewCheckinCmd(agentInfo, client, defaultCompression)
 
-			request := CheckinRequest{}
+			request := pkgfleetapi.CheckinRequest{}
 
 			r, _, err := cmd.Execute(ctx, &request)
 			require.NoError(t, err)
 
-			require.Equal(t, 0, len(r.Actions))
+			var actions pkgfleetapi.Actions
+			require.NoError(t, json.Unmarshal(r.Actions, &actions))
+			require.Equal(t, 0, len(actions))
 		},
 		func(config *remote.Config) {
 			config.Headers = map[string]string{
@@ -314,4 +330,72 @@ func TestCheckin(t *testing.T) {
 			}
 		},
 	))
+}
+
+func TestCheckinCompression(t *testing.T) {
+	const withAPIKey = "secret"
+	const resp = `{"actions": []}`
+	agentInfo := &agentinfo{}
+
+	testCases := []struct {
+		name           string
+		compression    string
+		wantCompressed bool
+	}{{
+		name:           "compression=gzip - request body is compressed",
+		compression:    "gzip",
+		wantCompressed: true,
+	}, {
+		name:           "compression=none - request body is not compressed",
+		compression:    "none",
+		wantCompressed: false,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, withServerWithAuthClient(
+			func(t *testing.T) *http.ServeMux {
+				t.Helper()
+
+				mux := http.NewServeMux()
+				path := fmt.Sprintf("/api/fleet/agents/%s/checkin", agentInfo.AgentID())
+				mux.HandleFunc(path, authHandler(func(w http.ResponseWriter, r *http.Request) {
+					checkinPayload, err := readMaybeCompressedCheckinBody(r)
+					require.NoError(t, err)
+
+					if tc.wantCompressed {
+						assert.Equal(t, "gzip", r.Header.Get("Content-Encoding"))
+					} else {
+						assert.Empty(t, r.Header.Get("Content-Encoding"))
+					}
+
+					var checkinRequest pkgfleetapi.CheckinRequest
+					require.NoError(t, json.Unmarshal(checkinPayload, &checkinRequest))
+
+					w.WriteHeader(http.StatusOK)
+					fmt.Fprint(w, resp)
+				}, withAPIKey))
+				return mux
+			},
+			withAPIKey,
+			func(t *testing.T, client client.Sender) {
+				cmd := pkgfleetapi.NewCheckinCmd(agentInfo, client, tc.compression)
+				_, _, err := cmd.Execute(t.Context(), &pkgfleetapi.CheckinRequest{})
+				require.NoError(t, err)
+			},
+		))
+	}
+}
+
+func readMaybeCompressedCheckinBody(r *http.Request) ([]byte, error) {
+	if r.Header.Get("Content-Encoding") != "gzip" {
+		return io.ReadAll(r.Body)
+	}
+
+	gzipReader, err := gzip.NewReader(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	defer gzipReader.Close()
+
+	return io.ReadAll(gzipReader)
 }

@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"path/filepath"
@@ -27,6 +29,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/elastic/elastic-agent-libs/redact"
 	"github.com/elastic/elastic-agent/pkg/control/v2/client"
 	integrationtest "github.com/elastic/elastic-agent/pkg/testing"
 	"github.com/elastic/elastic-agent/pkg/testing/define"
@@ -123,7 +126,7 @@ func TestDiagnosticsOptionalValues(t *testing.T) {
 	fixture, err := define.NewFixtureFromLocalBuild(t, define.Version())
 	require.NoError(t, err)
 
-	ctx, cancel := testcontext.WithDeadline(t, context.Background(), time.Now().Add(10*time.Minute))
+	ctx, cancel := testcontext.WithDeadline(t, t.Context(), time.Now().Add(10*time.Minute))
 	defer cancel()
 	err = fixture.Prepare(ctx, fakeComponent)
 	require.NoError(t, err)
@@ -135,7 +138,7 @@ func TestDiagnosticsOptionalValues(t *testing.T) {
 		Configure:  simpleConfig2,
 		AgentState: integrationtest.NewClientState(client.Healthy),
 		Components: componentSetup,
-		After:      testDiagnosticsFactory(t, componentSetup, diagpprof, diagCompPprof, fixture, []string{"diagnostics", "-p"}),
+		After:      testDiagnosticsFactory(t, componentSetup, diagpprof, diagCompPprof, fixture, []string{"diagnostics", "-p"}, false),
 	})
 	require.NoError(t, err)
 }
@@ -149,7 +152,7 @@ func TestIsolatedUnitsDiagnosticsOptionalValues(t *testing.T) {
 	fixture, err := define.NewFixtureFromLocalBuild(t, define.Version())
 	require.NoError(t, err)
 
-	ctx, cancel := testcontext.WithDeadline(t, context.Background(), time.Now().Add(10*time.Minute))
+	ctx, cancel := testcontext.WithDeadline(t, t.Context(), time.Now().Add(10*time.Minute))
 	defer cancel()
 	err = fixture.Prepare(ctx, fakeComponent)
 	require.NoError(t, err)
@@ -161,7 +164,7 @@ func TestIsolatedUnitsDiagnosticsOptionalValues(t *testing.T) {
 		Configure:  complexIsolatedUnitsConfig,
 		AgentState: integrationtest.NewClientState(client.Healthy),
 		Components: isolatedUnitsComponentSetup,
-		After:      testDiagnosticsFactory(t, isolatedUnitsComponentSetup, diagpprof, diagCompPprof, fixture, []string{"diagnostics", "-p"}),
+		After:      testDiagnosticsFactory(t, isolatedUnitsComponentSetup, diagpprof, diagCompPprof, fixture, []string{"diagnostics", "-p"}, false),
 	})
 	require.NoError(t, err)
 }
@@ -175,7 +178,7 @@ func TestDiagnosticsCommand(t *testing.T) {
 	f, err := define.NewFixtureFromLocalBuild(t, define.Version())
 	require.NoError(t, err)
 
-	ctx, cancel := testcontext.WithDeadline(t, context.Background(), time.Now().Add(10*time.Minute))
+	ctx, cancel := testcontext.WithDeadline(t, t.Context(), time.Now().Add(10*time.Minute))
 	defer cancel()
 	err = f.Prepare(ctx, fakeComponent)
 	require.NoError(t, err)
@@ -184,7 +187,7 @@ func TestDiagnosticsCommand(t *testing.T) {
 		Configure:  simpleConfig2,
 		AgentState: integrationtest.NewClientState(client.Healthy),
 		Components: componentSetup,
-		After:      testDiagnosticsFactory(t, componentSetup, diagnosticsFiles, compDiagnosticsFiles, f, []string{"diagnostics", "collect"}),
+		After:      testDiagnosticsFactory(t, componentSetup, diagnosticsFiles, compDiagnosticsFiles, f, []string{"diagnostics", "collect"}, false),
 	})
 	assert.NoError(t, err)
 }
@@ -198,7 +201,7 @@ func TestIsolatedUnitsDiagnosticsCommand(t *testing.T) {
 	f, err := define.NewFixtureFromLocalBuild(t, define.Version())
 	require.NoError(t, err)
 
-	ctx, cancel := testcontext.WithDeadline(t, context.Background(), time.Now().Add(10*time.Minute))
+	ctx, cancel := testcontext.WithDeadline(t, t.Context(), time.Now().Add(10*time.Minute))
 	defer cancel()
 	err = f.Prepare(ctx, fakeComponent)
 	require.NoError(t, err)
@@ -207,7 +210,7 @@ func TestIsolatedUnitsDiagnosticsCommand(t *testing.T) {
 		Configure:  complexIsolatedUnitsConfig,
 		AgentState: integrationtest.NewClientState(client.Healthy),
 		Components: isolatedUnitsComponentSetup,
-		After:      testDiagnosticsFactory(t, isolatedUnitsComponentSetup, diagnosticsFiles, compDiagnosticsFiles, f, []string{"diagnostics", "collect"}),
+		After:      testDiagnosticsFactory(t, isolatedUnitsComponentSetup, diagnosticsFiles, compDiagnosticsFiles, f, []string{"diagnostics", "collect"}, false),
 	})
 	assert.NoError(t, err)
 }
@@ -219,7 +222,7 @@ func TestRedactFleetSecretPathsDiagnostics(t *testing.T) {
 		Sudo:  true,
 	})
 
-	ctx, cancel := testcontext.WithTimeout(t, context.Background(), time.Minute*10)
+	ctx, cancel := testcontext.WithTimeout(t, t.Context(), time.Minute*10)
 	defer cancel()
 
 	t.Log("Setup fake fleet-server")
@@ -294,7 +297,7 @@ func TestRedactFleetSecretPathsDiagnostics(t *testing.T) {
 		case map[string]any:
 			for rootKey, value := range root {
 				if rootKey == "custom_attr" {
-					if value != "<REDACTED>" {
+					if value != redact.REDACTED {
 						return fmt.Errorf("found non-redacted value in %q", rootKey)
 					}
 				}
@@ -306,6 +309,33 @@ func TestRedactFleetSecretPathsDiagnostics(t *testing.T) {
 			}
 		default:
 			// ignore other types
+		}
+		return nil
+	}
+
+	checkConfigStripped := func(root map[string]any) error {
+		comps, ok := root["components"].([]any)
+		if !ok {
+			return nil
+		}
+		for _, comp := range comps {
+			compMap, ok := comp.(map[string]any)
+			if !ok {
+				continue
+			}
+			units, ok := compMap["units"].([]any)
+			if !ok {
+				continue
+			}
+			for _, unit := range units {
+				unitMap, ok := unit.(map[string]any)
+				if !ok {
+					continue
+				}
+				if _, hasConfig := unitMap["config"]; hasConfig {
+					return fmt.Errorf("found 'config' key in unit, expected it to be stripped")
+				}
+			}
 		}
 		return nil
 	}
@@ -323,8 +353,15 @@ func TestRedactFleetSecretPathsDiagnostics(t *testing.T) {
 		err = yaml.NewDecoder(f).Decode(&yObj)
 		require.NoError(t, err)
 
+		t.Logf("checking redaction for file %q", fileName)
 		err = checkRedacted(yObj)
 		require.NoError(t, err, "file %q has non-redacted values", path)
+
+		if strings.HasPrefix(fileName, "components-") {
+			t.Logf("checking unit config is stripped from file %q", fileName)
+			err = checkConfigStripped(yObj)
+			require.NoError(t, err, "file %q has unit config that should be stripped", path)
+		}
 	}
 }
 
@@ -336,7 +373,14 @@ func TestBeatDiagnostics(t *testing.T) {
 
 	esURL := integration.StartMockES(t, 0, 0, 0, 0)
 
-	configTemplate := `
+	// Mock HTTP server polled by the httpjson trace logs test case.
+	httpjsonServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"message":"hello"}`)
+	}))
+	t.Cleanup(httpjsonServer.Close)
+
+	fileStreamConfigTemplate := `
 inputs:
   - id: filestream-filebeat
     type: filestream
@@ -348,21 +392,46 @@ inputs:
 outputs:
   default:
     type: elasticsearch
+    preset: latency
     hosts: [{{ .ESHost }}]
     api_key: placeholder
-agent.monitoring.enabled: false
+agent.monitoring.enabled: {{ .MonitoringEnabled }}
+{{ if .MonitoringEnabled }}agent.monitoring.metrics_period: 2s{{ end }}
 agent.internal.runtime.filebeat.filestream: {{ .Runtime }}
 `
 
-	var filebeatSetup = map[string]integrationtest.ComponentState{
-		"filestream-default": {
-			State: integrationtest.NewClientState(client.Healthy),
-		},
-	}
+	// httpjsonTracerConfigTemplate runs httpjson as a normal filebeat subprocess (process
+	// mode). In that mode filebeat sets the global paths.Paths.Logs, so the httpjson tracer
+	// path validation works and writes trace files to {versionedHome}/components/logs/httpjson/
+	// — the directory the diagnostic bundle fix now collects.
+	httpjsonTracerConfigTemplate := `
+inputs:
+  - type: httpjson
+    id: httpjson-trace-test
+    use_output: default
+    streams:
+      - id: httpjson-trace-stream
+        data_stream:
+          dataset: httpjson.generic
+          type: logs
+        request.url: {{ .MockServerURL }}
+        request.tracer.filename: http-request-trace-*.ndjson
+        interval: 1s
+outputs:
+  default:
+    type: elasticsearch
+    hosts: [{{ .ESHost }}]
+    api_key: placeholder
+agent.monitoring.enabled: false
+# Force process (subprocess) mode for httpjson. The default runtime for all filebeat inputs
+# is otel (see DefaultRuntimeConfig), but in otel mode the fbreceiver stores paths in
+# b.Info.Paths rather than the global paths.Paths, so the httpjson tracer path validation
+# reads an uninitialised paths.Paths.Logs and rejects the tracer filename. In process mode
+# filebeat runs as a subprocess and initialises the global paths normally.
+agent.internal.runtime.filebeat.httpjson: process
+`
 
-	ctx, cancel := testcontext.WithDeadline(t, context.Background(), time.Now().Add(10*time.Minute))
-	defer cancel()
-	expectedComponentState := map[string]integrationtest.ComponentState{
+	fileStreamAgentCompState := map[string]integrationtest.ComponentState{
 		"filestream-default": {
 			State: integrationtest.NewClientState(client.Healthy),
 			Units: map[integrationtest.ComponentUnitKey]integrationtest.ComponentUnitState{
@@ -375,15 +444,80 @@ agent.internal.runtime.filebeat.filestream: {{ .Runtime }}
 			},
 		},
 	}
+
+	httpjsonAgentCompState := map[string]integrationtest.ComponentState{
+		"httpjson-default": {
+			State: integrationtest.NewClientState(client.Healthy),
+			Units: map[integrationtest.ComponentUnitKey]integrationtest.ComponentUnitState{
+				integrationtest.ComponentUnitKey{UnitType: client.UnitTypeOutput, UnitID: "httpjson-default"}: {
+					State: integrationtest.NewClientState(client.Healthy),
+				},
+				integrationtest.ComponentUnitKey{UnitType: client.UnitTypeInput, UnitID: "httpjson-default-httpjson-trace-test"}: {
+					State: integrationtest.NewClientState(client.Healthy),
+				},
+			},
+		},
+	}
+
+	ctx, cancel := testcontext.WithDeadline(t, t.Context(), time.Now().Add(10*time.Minute))
+	defer cancel()
 	expectedAgentState := integrationtest.NewClientState(client.Healthy)
 
 	testCases := []struct {
 		name                         string
 		runtime                      string
+		monitoringEnabled            bool
 		expectedCompDiagnosticsFiles []string
+		agentCompState               map[string]integrationtest.ComponentState
+		diagCompSetup                map[string]integrationtest.ComponentState
+		configTemplate               string
+		extraPatterns                []filePattern
+		// checkBeatReceiverTraceLogs tells testDiagnosticsFactory to assert that an
+		// httpjson trace log file is present in the bundle under logs/<commit>/.
+		checkBeatReceiverTraceLogs bool
 	}{
 		{
-			name:    "filebeat process",
+			name:              "filebeat process",
+			runtime:           "process",
+			monitoringEnabled: false,
+			expectedCompDiagnosticsFiles: append(compDiagnosticsFiles,
+				"registry.tar.gz",
+				"input_metrics.json",
+				"beat_metrics.json",
+				"beat-rendered-config.yml",
+				"global_processors.txt",
+			),
+			agentCompState: fileStreamAgentCompState,
+			diagCompSetup: map[string]integrationtest.ComponentState{
+				"filestream-default": {State: integrationtest.NewClientState(client.Healthy)},
+			},
+			configTemplate: fileStreamConfigTemplate,
+		},
+		{
+			// Beat receivers register diagnostic hooks per input stream via the OTel receiver
+			// instance ID ("<receiverType>/_agent-component/<comp.ID>/<streamID>"). Results are grouped
+			// at the component level and land under the component directory, same as for process-runtime beats.
+			name:              "filebeat receiver",
+			runtime:           "otel",
+			monitoringEnabled: true,
+			expectedCompDiagnosticsFiles: []string{
+				"registry.tar.gz",
+				"beat_metrics.json",
+				"input_metrics.json",
+			},
+			agentCompState: fileStreamAgentCompState,
+			diagCompSetup: map[string]integrationtest.ComponentState{
+				"filestream-default": {State: integrationtest.NewClientState(client.Healthy)},
+			},
+			configTemplate: fileStreamConfigTemplate,
+		},
+		{
+			// Verifies that beat receiver trace logs written to {versionedHome}/components/logs/
+			// are included in the diagnostic bundle under logs/<commit>/httpjson/.
+			// Uses httpjson in process mode: the filebeat subprocess sets the global
+			// paths.Paths.Logs so the tracer path validation succeeds, and trace files land in
+			// {versionedHome}/components/logs/httpjson/ — the path the fix now collects.
+			name:    "httpjson trace logs in bundle",
 			runtime: "process",
 			expectedCompDiagnosticsFiles: append(compDiagnosticsFiles,
 				"registry.tar.gz",
@@ -392,44 +526,39 @@ agent.internal.runtime.filebeat.filestream: {{ .Runtime }}
 				"beat-rendered-config.yml",
 				"global_processors.txt",
 			),
-		},
-		{
-			name:    "filebeat receiver",
-			runtime: "otel",
-			expectedCompDiagnosticsFiles: []string{
-				"registry.tar.gz",
-				"beat_metrics.json",
-				"input_metrics.json",
+			agentCompState: httpjsonAgentCompState,
+			diagCompSetup: map[string]integrationtest.ComponentState{
+				"httpjson-default": {State: integrationtest.NewClientState(client.Healthy)},
 			},
+			configTemplate:             httpjsonTracerConfigTemplate,
+			checkBeatReceiverTraceLogs: true,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Create the fixture
 			f, err := define.NewFixtureFromLocalBuild(t, define.Version(), integrationtest.WithAllowErrors())
 			require.NoError(t, err)
 			err = f.Prepare(ctx)
 			require.NoError(t, err)
 
-			// Create the data file to ingest
-			inputFile, err := os.CreateTemp(t.TempDir(), "input.txt")
-			require.NoError(t, err, "failed to create temp file to hold data to ingest")
-			t.Cleanup(func() {
-				cErr := inputFile.Close()
-				assert.NoError(t, cErr)
-			})
-			_, err = inputFile.WriteString("hello world\n")
-			require.NoError(t, err, "failed to write data to temp file")
+			// Create the data file to ingest (used by filestream cases).
+			inputFilePath := filepath.Join(t.TempDir(), "input.txt")
+			err = os.WriteFile(inputFilePath, []byte("hello world\n"), 0o600)
+			require.NoError(t, err, "failed to create input file for ingestion")
 
 			var configBuffer bytes.Buffer
 			require.NoError(t,
-				template.Must(template.New("config").Parse(configTemplate)).Execute(&configBuffer, map[string]any{
-					"Runtime":   tc.runtime,
-					"InputFile": inputFile.Name(),
-					"ESHost":    esURL.Host,
+				template.Must(template.New("config").Parse(tc.configTemplate)).Execute(&configBuffer, map[string]any{
+					"Runtime":           tc.runtime,
+					"InputFile":         inputFilePath,
+					"ESHost":            esURL.Host,
+					"MonitoringEnabled": tc.monitoringEnabled,
+					"MockServerURL":     httpjsonServer.URL,
 				}))
+
 			expDiagFiles := append([]string{}, diagnosticsFiles...)
+			extraPatterns := append([]filePattern{}, tc.extraPatterns...)
 			if tc.runtime == "otel" {
 				// EDOT adds these extra files.
 				// TestBeatDiagnostics is quite strict about what it expects to see in the archive.
@@ -442,11 +571,20 @@ agent.internal.runtime.filebeat.filestream: {{ .Runtime }}
 					"edot/threadcreate.profile.gz",
 					"edot/otel-merged-actual.yaml")
 			}
+			if tc.monitoringEnabled {
+				// When OTel-based elasticsearch monitoring is active, the manager
+				// injects a file exporter that writes zstd-compressed OTLP JSON
+				// telemetry alongside the agent's own log files.
+				extraPatterns = append(extraPatterns, filePattern{
+					pattern:  path.Join("logs", "*", "elastic-agent-metrics.ndjson"),
+					optional: false,
+				})
+			}
 			err = f.Run(ctx, integrationtest.State{
 				Configure:  configBuffer.String(),
 				AgentState: expectedAgentState,
-				Components: expectedComponentState,
-				After:      testDiagnosticsFactory(t, filebeatSetup, expDiagFiles, tc.expectedCompDiagnosticsFiles, f, []string{"diagnostics", "collect"}),
+				Components: tc.agentCompState,
+				After:      testDiagnosticsFactory(t, tc.diagCompSetup, expDiagFiles, tc.expectedCompDiagnosticsFiles, f, []string{"diagnostics", "collect"}, tc.checkBeatReceiverTraceLogs, extraPatterns...),
 			})
 			assert.NoError(t, err)
 		})
@@ -479,27 +617,22 @@ agent.monitoring.enabled: false
 agent.internal.runtime.filebeat.filestream: otel
 `
 
-	ctx, cancel := testcontext.WithDeadline(t, context.Background(), time.Now().Add(10*time.Minute))
+	ctx, cancel := testcontext.WithDeadline(t, t.Context(), time.Now().Add(10*time.Minute))
 	defer cancel()
 
 	// Create the fixture
 	f, err := define.NewFixtureFromLocalBuild(t, define.Version(), integrationtest.WithAllowErrors())
 	require.NoError(t, err)
 
-	// Create the data file to ingest
-	inputFile, err := os.CreateTemp(t.TempDir(), "input.txt")
-	require.NoError(t, err, "failed to create temp file to hold data to ingest")
-	t.Cleanup(func() {
-		cErr := inputFile.Close()
-		assert.NoError(t, cErr)
-	})
-	_, err = inputFile.WriteString("hello world\n")
-	require.NoError(t, err, "failed to write data to temp file")
+	// Create the data file to ingest.
+	inputFilePath := filepath.Join(t.TempDir(), "input.txt")
+	err = os.WriteFile(inputFilePath, []byte("hello world\n"), 0o600)
+	require.NoError(t, err, "failed to create input file for ingestion")
 
 	var configBuffer bytes.Buffer
 	require.NoError(t,
 		template.Must(template.New("config").Parse(configTemplate)).Execute(&configBuffer, map[string]any{
-			"InputFile": inputFile.Name(),
+			"InputFile": inputFilePath,
 		}))
 	err = f.Prepare(ctx)
 	require.NoError(t, err)
@@ -531,6 +664,9 @@ agent.internal.runtime.filebeat.filestream: otel
 
 	extractZipArchive(t, diagZip, extractionDir)
 
+	// Beat receivers register diagnostic hooks per input stream via the OTel receiver
+	// instance ID ("<receiverType>/_agent-component/<comp.ID>/<streamID>"). Results are grouped
+	// at the component level and land under the component directory, same as for process-runtime beats.
 	expectedFiles := []string{
 		"edot/otel-merged-actual.yaml",
 		"edot/allocs.profile.gz",
@@ -553,15 +689,45 @@ agent.internal.runtime.filebeat.filestream: otel
 	verifyFilebeatRegistry(t, filepath.Join(extractionDir, "components/filestream-default/registry.tar.gz"))
 }
 
-func testDiagnosticsFactory(t *testing.T, compSetup map[string]integrationtest.ComponentState, diagFiles []string, diagCompFiles []string, fix *integrationtest.Fixture, cmd []string) func(ctx context.Context) error {
+func testDiagnosticsFactory(t *testing.T, compSetup map[string]integrationtest.ComponentState, diagFiles []string, diagCompFiles []string, fix *integrationtest.Fixture, cmd []string, checkBeatReceiverTraceLogs bool, extraPatterns ...filePattern) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
+		// If any required extra patterns are present (e.g. the metrics file
+		// written by the OTel file exporter after the first collection cycle),
+		// wait long enough for at least one cycle to complete before gathering
+		// diagnostics. The metrics period configured in the test is 2 s, so
+		// 10 s gives a comfortable margin even if the OTel monitoring collector
+		// takes a few seconds to start after the agent reports HEALTHY.
+		needsWait := checkBeatReceiverTraceLogs
+		for _, p := range extraPatterns {
+			if !p.optional {
+				needsWait = true
+				break
+			}
+		}
+		if needsWait {
+			select {
+			case <-time.After(10 * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
 		diagZip, err := fix.ExecDiagnostics(ctx, cmd...)
 
 		// get the version of the running agent
 		avi, err := getRunningAgentVersion(ctx, fix)
 		require.NoError(t, err)
 
-		verifyDiagnosticArchive(t, compSetup, diagZip, diagFiles, diagCompFiles, avi)
+		if checkBeatReceiverTraceLogs {
+			// The diagnostic bundle places logs under logs/<commit>/components. Use the real
+			// commit hash so the pattern matches the exact path in the bundle.
+			extraPatterns = append(extraPatterns, filePattern{
+				pattern:  path.Join("logs", "elastic-agent-"+avi.Commit[:6], "components", "httpjson", "http-request-trace-*.ndjson"),
+				optional: false,
+			})
+		}
+
+		verifyDiagnosticArchive(t, compSetup, diagZip, diagFiles, diagCompFiles, avi, extraPatterns...)
 
 		// preserve the diagnostic archive if the test failed
 		if t.Failed() {
@@ -572,7 +738,7 @@ func testDiagnosticsFactory(t *testing.T, compSetup map[string]integrationtest.C
 	}
 }
 
-func verifyDiagnosticArchive(t *testing.T, compSetup map[string]integrationtest.ComponentState, diagArchive string, diagFiles []string, diagCompFiles []string, avi *client.Version) {
+func verifyDiagnosticArchive(t *testing.T, compSetup map[string]integrationtest.ComponentState, diagArchive string, diagFiles []string, diagCompFiles []string, avi *client.Version, extraPatterns ...filePattern) {
 	// check that the archive is not an empty file
 	stat, err := os.Stat(diagArchive)
 	require.NoErrorf(t, err, "stat file %q failed", diagArchive)
@@ -585,6 +751,7 @@ func verifyDiagnosticArchive(t *testing.T, compSetup map[string]integrationtest.
 
 	compAndUnitNames := extractComponentAndUnitNames(compSetup)
 	expectedDiagArchiveFilePatterns := compileExpectedDiagnosticFilePatterns(avi, diagFiles, diagCompFiles, compAndUnitNames)
+	expectedDiagArchiveFilePatterns = append(expectedDiagArchiveFilePatterns, extraPatterns...)
 
 	expectedExtractedFiles := map[string]struct{}{}
 	for _, filePattern := range expectedDiagArchiveFilePatterns {

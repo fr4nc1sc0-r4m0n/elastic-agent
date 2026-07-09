@@ -45,6 +45,8 @@ linters:
     forbidigo:
       forbid:
         - pattern: fmt.Print.*
+        - pattern: ^context\.Background$
+          msg: "use t.Context() in tests so the context is cancelled when the test ends"
       exclude-godoc-examples: true
     gomoddirectives:
       replace-allow-list:
@@ -60,8 +62,7 @@ linters:
         - github.com/meraki/dashboard-api-go/v3
         - go.opentelemetry.io/otel/exporters/prometheus
         - github.com/elastic/elastic-agent/internal/edot
-        - github.com/open-telemetry/opentelemetry-collector-contrib/internal/healthcheck
-        - github.com/open-telemetry/opentelemetry-collector-contrib/pkg/status
+        - github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter
       replace-local: true
     gomodguard:
       blocked:
@@ -103,10 +104,15 @@ linters:
       - linters:
           - forbidigo
         path: (.*magefile.go|.*dev-tools/mage/.*)
+      - linters:
+          - forbidigo
+        path-except: "testing/integration/.*_test\\.go$"
+        text: "use t\\.Context\\(\\) in tests"
     paths:
       - third_party$
       - builtin$
       - examples$
+      - ^beats
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0

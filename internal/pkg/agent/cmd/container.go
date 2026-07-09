@@ -53,6 +53,7 @@ import (
 	"github.com/elastic/elastic-agent/pkg/core/process"
 	"github.com/elastic/elastic-agent/pkg/utils"
 	"github.com/elastic/elastic-agent/version"
+	"github.com/elastic/go-ucfg"
 )
 
 const (
@@ -86,16 +87,16 @@ The following actions are possible and grouped based on the actions.
 
   FLEET_ENROLL - set to 1 for enrollment into Fleet Server. If not set, Elastic Agent is run in standalone mode.
   FLEET_URL - URL of the Fleet Server to enroll into
-  FLEET_ENROLLMENT_TOKEN - token to use for enrollment. This is not needed in case FLEET_SERVER_ENABLED and FLEET_ENROLL is set. Then the token is fetched from Kibana.
-  FLEET_ENROLL_TIMEOUT - The timeout duration for the enroll commnd. Defaults to 10m. A negative value disables the timeout.
+  FLEET_ENROLLMENT_TOKEN - token to use for enrollment. This is not needed in case FLEET_SERVER_ENABLE and FLEET_ENROLL is set. Then the token is fetched from Kibana.
+  FLEET_ENROLL_TIMEOUT - The timeout duration for the enroll command. Defaults to 10m. A negative value disables the timeout.
   FLEET_CA - path to certificate authority to use with communicate with Fleet Server [$KIBANA_CA]
   FLEET_INSECURE - communicate with Fleet with either insecure HTTP or unverified HTTPS
   ELASTIC_AGENT_CERT - path to certificate to use for connecting to fleet-server.
   ELASTIC_AGENT_CERT_KEY - path to private key use for connecting to fleet-server.
 
-  The following vars are need in the scenario that Elastic Agent should automatically fetch its own token.
+  The following vars are needed in the scenario that Elastic Agent should automatically fetch its own token.
 
-  KIBANA_FLEET_HOST - Kibana host to enable create enrollment token on [$KIBANA_HOST]
+  KIBANA_FLEET_HOST - Kibana host to create an enrollment token on [$KIBANA_HOST]
   FLEET_TOKEN_NAME - token name to use for fetching token from Kibana. This requires Kibana configs to be set.
   FLEET_TOKEN_POLICY_NAME - token policy name to use for fetching token from Kibana. This requires Kibana configs to be set.
 
@@ -131,8 +132,8 @@ The following actions are possible and grouped based on the actions.
   should not setup Fleet.
 
   KIBANA_FLEET_HOST - Kibana host accessible from Fleet Server. [$KIBANA_HOST]
-  KIBANA_FLEET_USERNAME - Kibana username to service token [$KIBANA_USERNAME]
-  KIBANA_FLEET_PASSWORD - Kibana password to service token [$KIBANA_PASSWORD]
+  KIBANA_FLEET_USERNAME - Kibana username for service token [$KIBANA_USERNAME]
+  KIBANA_FLEET_PASSWORD - Kibana password for service token [$KIBANA_PASSWORD]
   KIBANA_FLEET_CA - path to certificate authority to use with communicate with Kibana [$KIBANA_CA]
   KIBANA_REQUEST_RETRY_SLEEP - sleep duration taken when agent performs a request to Kibana [default 1s]
   KIBANA_REQUEST_RETRY_COUNT - number of retries agent performs when executing a request to Kibana [default 30]
@@ -351,7 +352,7 @@ func runContainerCmd(streams *cli.IOStreams, cfg setupConfig) error {
 		if err != nil {
 			return err
 		}
-		enroll := exec.Command(executable, cmdArgs...)
+		enroll := exec.CommandContext(context.Background(), executable, cmdArgs...)
 		enroll.Stdout = streams.Out
 		enroll.Stderr = streams.Err
 		err = enroll.Start()
@@ -744,6 +745,36 @@ func envMap(key string) map[string]string {
 	return m
 }
 
+func envStringMap(envKey string) map[string]string {
+	input, ok := os.LookupEnv(envKey)
+	if !ok {
+		return nil
+	}
+
+	// This regex captures:
+	// 1. A key (\w+)
+	// 2. An equals sign (=)
+	// 3. Either a quoted string "([^"]*)" OR unquoted characters ([^,]+)
+	re := regexp.MustCompile(`([\w\-]+)=(?:"([^"]*)"|([^,]+))`)
+	matches := re.FindAllStringSubmatch(input, -1)
+
+	result := make(map[string]string)
+	for _, match := range matches {
+		key := match[1]
+		quotedVal := match[2]
+		unquotedVal := match[3]
+
+		// Use whichever capture group found a match
+		if quotedVal != "" {
+			result[key] = quotedVal
+		} else {
+			result[key] = unquotedVal
+		}
+	}
+
+	return result
+}
+
 func isTrue(val string) bool {
 	trueVals := []string{"1", "true", "yes", "y"}
 	val = strings.ToLower(val)
@@ -845,38 +876,35 @@ func runLegacyAPMServer(streams *cli.IOStreams) (*process.Info, error) {
 	return process.Start(spec.BinaryPath, options...)
 }
 
-func containerCfgOverrides(cfg *configuration.Configuration) {
-	logsPath := envWithDefault("", "LOGS_PATH")
-	if logsPath == "" {
-		// when no LOGS_PATH defined the container should log to stderr
-		cfg.Settings.LoggingConfig.ToStderr = true
-		cfg.Settings.LoggingConfig.ToFiles = false
+func containerCfgOverrides(cfg *config.Config) error {
+	uCfg := map[string]any{}
+
+	if logsPath := envWithDefault("", "LOGS_PATH"); logsPath == "" {
+		uCfg["agent.logging.to_stderr"] = true
+		uCfg["agent.logging.to_files"] = false
 	}
 
 	if envBool("HTTPPROF") {
-		// sanity checks to ensure monitoring config is setup
-		if cfg.Settings.MonitoringConfig == nil {
-			cfg.Settings.MonitoringConfig = monitoringCfg.DefaultConfig()
-		}
-
-		if cfg.Settings.MonitoringConfig.Pprof == nil {
-			cfg.Settings.MonitoringConfig.Pprof = &monitoringCfg.PprofConfig{}
-		}
-
-		cfg.Settings.MonitoringConfig.Pprof.Enabled = true
+		uCfg["agent.monitoring.pprof.enabled"] = true
 	}
 
 	eventsToStderrEnv := envWithDefault("false", "EVENTS_TO_STDERR")
 	eventsToStderr, err := strconv.ParseBool(eventsToStderrEnv)
 	if err != nil {
-		logp.Warn("cannot parse EVENS_TO_STDERR='%s' as boolean, logging events to file'", eventsToStderrEnv)
+		logp.Warn("cannot parse EVENTS_TO_STDERR='%s' as boolean, logging events to file", eventsToStderrEnv)
 	}
 	if eventsToStderr {
-		cfg.Settings.EventLoggingConfig.ToFiles = false
-		cfg.Settings.EventLoggingConfig.ToStderr = true
+		uCfg["agent.logging.event_data.to_files"] = false
+		uCfg["agent.logging.event_data.to_stderr"] = true
 	}
 
-	configuration.OverrideDefaultContainerGRPCPort(cfg.Settings.GRPC)
+	uCfg["agent.grpc.port"] = configuration.GetContainerGRPCPort()
+
+	// Always read certs from env.
+	uCfg["fleet.ssl.certificate"] = envWithDefault("", "ELASTIC_AGENT_CERT")
+	uCfg["fleet.ssl.key"] = envWithDefault("", "ELASTIC_AGENT_CERT_KEY")
+
+	return cfg.Merge(uCfg)
 }
 
 func setPaths(statePath, configPath, logsPath, socketPath string, writePaths bool) error {
@@ -1146,6 +1174,15 @@ func shouldFleetEnroll(setupCfg setupConfig) (bool, error) {
 	cfg, err := config.NewConfigFrom(reader)
 	if err != nil {
 		return false, fmt.Errorf("failed to read from disk store: %w", err)
+	}
+
+	err = cfg.Agent.SetString("fleet.ssl.certificate", -1, envWithDefault("", "ELASTIC_AGENT_CERT"), ucfg.PathSep("."))
+	if err != nil {
+		return false, fmt.Errorf("failed to override cert: %w", err)
+	}
+	err = cfg.Agent.SetString("fleet.ssl.key", -1, envWithDefault("", "ELASTIC_AGENT_CERT_KEY"), ucfg.PathSep("."))
+	if err != nil {
+		return false, fmt.Errorf("failed to override cert key: %w", err)
 	}
 
 	storedConfig, err := configuration.NewFromConfig(cfg)

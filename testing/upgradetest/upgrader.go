@@ -20,10 +20,10 @@ import (
 	"github.com/otiai10/copy"
 
 	"github.com/elastic/elastic-agent/internal/pkg/acl"
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/details"
 	v1client "github.com/elastic/elastic-agent/pkg/control/v1/client"
 	v2proto "github.com/elastic/elastic-agent/pkg/control/v2/cproto"
 	atesting "github.com/elastic/elastic-agent/pkg/testing"
+	"github.com/elastic/elastic-agent/pkg/upgrade/details"
 	"github.com/elastic/elastic-agent/pkg/version"
 )
 
@@ -453,7 +453,7 @@ func PerformUpgrade(
 
 	// validate again that the installation is correct, upgrade should not have changed installation validation
 	if InstallChecksAllowed(!installOpts.Privileged, startVersion, endVersion) {
-		err = installtest.CheckSuccess(ctx, startFixture, installOpts.BasePath, &installtest.CheckOpts{Privileged: installOpts.Privileged})
+		err = installtest.CheckSuccess(ctx, startFixture, installOpts.BasePath, &installtest.CheckOpts{Privileged: installOpts.Privileged, TargetVersion: endVersionInfo.Binary.String(), StartVersion: startVersionInfo.Binary.String()})
 		if err != nil {
 			return fmt.Errorf("post-upgrade installation checks failed: %w", err)
 		}

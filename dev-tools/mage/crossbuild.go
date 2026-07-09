@@ -7,11 +7,12 @@ package mage
 import (
 	"context"
 	"fmt"
-	"go/build"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -20,7 +21,7 @@ import (
 	"github.com/magefile/mage/sh"
 
 	"github.com/elastic/elastic-agent-libs/file"
-	"github.com/elastic/elastic-agent/dev-tools/mage/gotool"
+	"github.com/elastic/elastic-agent/dev-tools/packaging"
 )
 
 const defaultCrossBuildTarget = "golangCrossBuild"
@@ -136,12 +137,6 @@ func CrossBuild(ctx context.Context, cfg *Settings, options ...CrossBuildOption)
 		return err
 	}
 
-	if cfg.CrossBuild.MountModcache {
-		// Make sure the module dependencies are downloaded on the host,
-		// as they will be mounted into the container read-only.
-		mg.Deps(func() error { return gotool.Mod.Download() })
-	}
-
 	// Build the magefile for Linux, so we can run it inside the container.
 	mg.Deps(buildMage)
 
@@ -151,6 +146,18 @@ func CrossBuild(ctx context.Context, cfg *Settings, options ...CrossBuildOption)
 		if !buildPlatform.Flags.CanCrossBuild() {
 			return fmt.Errorf("unsupported cross build platform %v", buildPlatform.Name)
 		}
+
+		if cfg.Build.FIPSBuild {
+			fipsConfig := packaging.Settings().FIPS
+			if !slices.ContainsFunc(fipsConfig.Compile.Platforms, func(p packaging.Platform) bool {
+				return p.Platform() == buildPlatform.Name
+			}) {
+				log.Printf("Skipping crossbuild of %q for platform %q since it's not listed in FIPS supported platforms",
+					params.Name, buildPlatform.Name)
+				continue
+			}
+		}
+
 		builder := GolangCrossBuilder{Platform: buildPlatform.Name, Target: params.Target, InDir: params.InDir, ImageSelector: params.ImageSelector, Config: cfg}
 		if params.Serial {
 			if err := builder.Build(); err != nil {
@@ -166,15 +173,6 @@ func CrossBuild(ctx context.Context, cfg *Settings, options ...CrossBuildOption)
 	Parallel(deps...)
 
 	return nil
-}
-
-// CrossBuildXPack executes the 'golangCrossBuild' target in the Beat's
-// associated x-pack directory to produce a version of the Beat that contains
-// Elastic licensed content.
-func CrossBuildXPack(ctx context.Context, cfg *Settings, options ...CrossBuildOption) error {
-	o := []CrossBuildOption{InDir("x-pack", cfg.Beat.Name)}
-	o = append(o, options...)
-	return CrossBuild(ctx, cfg, o...)
 }
 
 // buildMage pre-compiles the magefile to a binary using the GOARCH parameter.
@@ -214,10 +212,6 @@ func CrossBuildImage(cfg *Settings, platform string) (string, error) {
 	}
 
 	goVersion := cfg.GoVersion()
-
-	if cfg.Build.FIPSBuild {
-		tagSuffix += "-fips"
-	}
 
 	return BeatsCrossBuildImage + ":" + goVersion + "-" + tagSuffix, nil
 }
@@ -290,24 +284,30 @@ func (b GolangCrossBuilder) Build() error {
 		args = append(args,
 			"--env", fmt.Sprintf("EXEC_UID=%d", uid),
 			"--env", fmt.Sprintf("EXEC_GID=%d", gid),
+			"--env", fmt.Sprintf("CROSSBUILD_UID=%d", uid),
+			"--env", fmt.Sprintf("CROSSBUILD_GID=%d", gid),
 		)
 	}
 	if cfg.Build.VersionQualified {
 		args = append(args, "--env", "VERSION_QUALIFIER="+cfg.Build.VersionQualifier)
 	}
-	if cfg.CrossBuild.MountModcache {
-		// Mount $GOPATH/pkg/mod into the container, read-only.
-		hostDir := filepath.Join(build.Default.GOPATH, "pkg", "mod")
-		args = append(args, "-v", hostDir+":/go/pkg/mod:ro")
+
+	// Mount the mod cache directory into the container
+	hostModCacheDir, err := sh.Output("go", "env", "GOMODCACHE")
+	if err != nil {
+		return fmt.Errorf("error determining the Go mod cache location: %w", err)
 	}
+	modCacheLocation := "/tmp/.cache/gomod"
+	args = append(args, "-v", fmt.Sprintf("%s:%s", hostModCacheDir, modCacheLocation))
 
 	buildCacheLocation := "/tmp/.cache/go-build"
-	if cfg.CrossBuild.MountBuildCache {
-		// Mount the go build cache volume into the container.
-		args = append(args,
-			"-v", fmt.Sprintf("%s:%s", cfg.CrossBuild.BuildCacheVolumeName, buildCacheLocation),
-		)
+	hostCacheDir, err := sh.Output("go", "env", "GOCACHE")
+	if err != nil {
+		return fmt.Errorf("error determining the Go build cache location: %w", err)
 	}
+	args = append(args,
+		"-v", fmt.Sprintf("%s:%s", hostCacheDir, buildCacheLocation),
+	)
 
 	// Mount /opt/git-mirrors (if present) to resolve git alternates in CI
 	if _, err := os.Stat("/opt/git-mirrors"); err == nil {
@@ -316,8 +316,8 @@ func (b GolangCrossBuilder) Build() error {
 
 	args = append(args,
 		"--rm",
-		"--env", "GOFLAGS=-mod=readonly",
-		"--env", fmt.Sprintf("GOCACHE=%s", buildCacheLocation), // ensure this is writable by the user
+		"--env", fmt.Sprintf("GOCACHE=%s", buildCacheLocation),
+		"--env", fmt.Sprintf("GOMODCACHE=%s", modCacheLocation),
 		"--env", "MAGEFILE_VERBOSE="+verbose,
 		"--env", "MAGEFILE_TIMEOUT="+EnvOr("MAGEFILE_TIMEOUT", ""),
 		"--env", fmt.Sprintf("SNAPSHOT=%v", cfg.Build.Snapshot),
@@ -379,7 +379,18 @@ func chownPaths(uid, gid int, path string) error {
 		log.Printf("chown took: %v, changed %d files", time.Since(start), numFixed)
 	}()
 
-	return filepath.Walk(path, func(name string, info os.FileInfo, err error) error {
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return fmt.Errorf("failed to open root %q: %w", path, err)
+	}
+	defer root.Close()
+
+	return fs.WalkDir(root.FS(), ".", func(name string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		info, err := d.Info()
 		if err != nil {
 			return err
 		}
@@ -396,7 +407,7 @@ func chownPaths(uid, gid int, path string) error {
 			return nil
 		}
 
-		if err := os.Chown(name, uid, gid); err != nil {
+		if err := root.Lchown(name, uid, gid); err != nil {
 			return fmt.Errorf("failed to chown path=%v : %w", name, err)
 		}
 		numFixed++

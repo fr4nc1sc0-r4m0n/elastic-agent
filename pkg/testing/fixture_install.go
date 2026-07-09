@@ -29,6 +29,7 @@ import (
 	"github.com/elastic/elastic-agent/pkg/control"
 	"github.com/elastic/elastic-agent/pkg/control/v2/client"
 	"github.com/elastic/elastic-agent/pkg/core/process"
+	agentversion "github.com/elastic/elastic-agent/pkg/version"
 )
 
 // ErrNotInstalled is returned in cases where Agent isn't installed
@@ -244,6 +245,18 @@ func (f *Fixture) installNoPkgManager(ctx context.Context, installOpts *InstallO
 	}
 
 	installArgs = append(installArgs, installOpts.ToCmdArgs()...)
+
+	// Speed up integration tests by having the agent check in with Fleet on
+	// state changes rather than waiting the full polling interval. Tests that
+	// need the standard poll-based mode should pass WithStandardCheckinMode()
+	// when creating their fixture.
+	// Gate on the fixture version: the flag was introduced in 9.3.6-SNAPSHOT /
+	// 9.4.3-SNAPSHOT / 9.5.0-SNAPSHOT depending on the minor line, so older
+	// binaries (e.g. the start agent in upgrade tests) would reject it.
+	if !f.useStandardCheckinMode && supportsCheckinOnStateChange(f.version) {
+		installArgs = append(installArgs, "--checkin-on-state-change")
+	}
+
 	out, err := f.Exec(ctx, installArgs, opts...)
 	if err != nil {
 		f.DumpProcesses("-install")
@@ -361,6 +374,10 @@ func (f *Fixture) installNoPkgManager(ctx context.Context, installOpts *InstallO
 			return
 		}
 		require.NoErrorf(f.t, err, "uninstalling agent failed. Output: %q", out)
+
+		for _, hook := range f.postUninstallHooks {
+			hook(f.t)
+		}
 	})
 
 	return out, nil
@@ -628,10 +645,19 @@ func (f *Fixture) installRpm(ctx context.Context, installOpts *InstallOpts, shou
 		}
 
 		f.t.Logf("removing installed agent files")
-		out, err = exec.CommandContext(uninstallCtx, "sudo", "rm", "-rf", "/var/lib/elastic-agent", "/var/log/elastic-agent", "/etc/elastic-agent").CombinedOutput()
+		basePath := "/"
+		if installOpts.BasePath != "" {
+			basePath = installOpts.BasePath
+		}
+		rmArgs := []string{"rm", "-rf",
+			filepath.Join(basePath, "var/lib/elastic-agent"),
+			filepath.Join(basePath, "var/log/elastic-agent"),
+			filepath.Join(basePath, "etc/elastic-agent"),
+		}
+		out, err = exec.CommandContext(uninstallCtx, "sudo", rmArgs...).CombinedOutput()
 		if err != nil {
 			f.t.Log(string(out))
-			f.t.Logf("failed to 'sudo rm -rf /var/lib/elastic-agent /var/log/elastic-agent/ /etc/elastic-agent'")
+			f.t.Logf("failed to remove installed agent files: %v", rmArgs)
 			f.t.FailNow()
 		}
 	})
@@ -886,4 +912,21 @@ func KeepInstalledFlag() bool {
 	// failure reports false (ignore error)
 	v, _ := strconv.ParseBool(os.Getenv("AGENT_KEEP_INSTALLED"))
 	return v
+}
+
+// supportsCheckinOnStateChange returns true when the given version string is new enough
+// to support the --checkin-on-state-change install/enroll flag.
+func supportsCheckinOnStateChange(versionStr string) bool {
+	parsed, err := agentversion.ParseVersion(versionStr)
+	if err != nil {
+		return false
+	}
+
+	// The flag was backported to 9.4.3-SNAPSHOT in the 9.4 line; 9.4.0–9.4.2 do not have it.
+	if parsed.Major() == 9 && parsed.Minor() == 4 {
+		return !parsed.Less(*agentversion.NewParsedSemVer(9, 4, 3, "SNAPSHOT", ""))
+	}
+
+	// The flag only exists in 9.3.6-SNAPSHOT and above otherwise.
+	return !parsed.Less(*agentversion.NewParsedSemVer(9, 3, 6, "SNAPSHOT", ""))
 }

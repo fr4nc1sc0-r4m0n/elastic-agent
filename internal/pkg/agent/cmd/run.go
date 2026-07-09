@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/collector/featuregate"
+
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/enroll"
 	fleetgateway "github.com/elastic/elastic-agent/internal/pkg/agent/application/gateway/fleet"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/ttl"
@@ -51,7 +53,6 @@ import (
 	"github.com/elastic/elastic-agent/internal/pkg/agent/migration"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/storage"
 	"github.com/elastic/elastic-agent/internal/pkg/cli"
-	"github.com/elastic/elastic-agent/internal/pkg/config"
 	monitoringCfg "github.com/elastic/elastic-agent/internal/pkg/core/monitoring/config"
 	"github.com/elastic/elastic-agent/internal/pkg/diagnostics"
 	"github.com/elastic/elastic-agent/internal/pkg/release"
@@ -59,6 +60,7 @@ import (
 	"github.com/elastic/elastic-agent/pkg/control/v2/server"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
 	"github.com/elastic/elastic-agent/pkg/utils"
+	agtversion "github.com/elastic/elastic-agent/pkg/version"
 	"github.com/elastic/elastic-agent/version"
 )
 
@@ -122,7 +124,7 @@ func newRunCommandWithArgs(_ []string, streams *cli.IOStreams) *cobra.Command {
 	return cmd
 }
 
-func run(override application.CfgOverrider, testingMode bool, fleetInitTimeout time.Duration, modifiers ...component.PlatformModifier) error {
+func run(override configuration.CfgOverrider, testingMode bool, fleetInitTimeout time.Duration, modifiers ...component.PlatformModifier) error {
 	// Windows: Mark service as stopped.
 	// After this is run, the service is considered by the OS to be stopped.
 	// This must be the first deferred cleanup task (last to execute).
@@ -138,6 +140,9 @@ func run(override application.CfgOverrider, testingMode bool, fleetInitTimeout t
 	stop := make(chan bool)
 	ctx, cancel := context.WithCancel(context.Background())
 	stopBeat := func() {
+		// Cancel ctx so any ctx-aware work running before the main select
+		// loop on `stop` is reached returns promptly.
+		cancel()
 		close(stop)
 	}
 
@@ -160,19 +165,17 @@ func logReturn(l *logger.Logger, err error) error {
 func runElasticAgentCritical(
 	ctx context.Context,
 	cancel context.CancelFunc,
-	override application.CfgOverrider,
+	override configuration.CfgOverrider,
 	stop chan bool,
 	testingMode bool,
 	fleetInitTimeout time.Duration,
 	modifiers ...component.PlatformModifier,
 ) error {
-	var errs []error
-
-	// early handleUpgrade, but don't error yet
-	initialUpdateMarker, err := handleUpgrade()
-	if err != nil {
-		errs = append(errs, fmt.Errorf("failed to handle upgrade: %w", err))
-	}
+	var (
+		errs                []error
+		err                 error
+		initialUpdateMarker *upgrade.UpdateMarker
+	)
 
 	// single run, but don't error yet
 	locker := filelock.NewAppLocker(paths.Data(), paths.AgentLockFileName)
@@ -192,13 +195,22 @@ func runElasticAgentCritical(
 		}
 	}
 
+	// enabled feature gate for merging configuration, important for merging persisted configuration with fleet configuration
+	// no need to check for error, this is guarded in tests
+	// agentless controller needs this feature gate to be enabled to merge persisted configuration with fleet configuration
+	// we inject some common extensions and processors in the persisted configuration that are overriding
+	// the ones from the fleet configuration in case this feature is disabled.
+	_ = featuregate.GlobalRegistry().Set("confmap.enableMergeAppendOption", true)
+
 	// try load config, but don't error yet
-	cfg, err := loadConfig(ctx, override)
+	cfg, err := configuration.LoadConfig(ctx, override)
 	if err != nil {
 		// failed to load configuration, just load the default to create the logger
 		errs = append(errs, fmt.Errorf("failed to load configuration: %w", err))
 		cfg = configuration.DefaultConfiguration()
 	}
+
+	applyCustomLogsPath(cfg)
 
 	baseLogger, err := logger.NewFromConfig("", cfg.Settings.LoggingConfig, cfg.Settings.EventLoggingConfig, true)
 	if err != nil {
@@ -227,6 +239,12 @@ func runElasticAgentCritical(
 
 	l := baseLogger.With("log.source", agentName)
 
+	// handleUpgrade, but don't error yet
+	initialUpdateMarker, err = handleUpgrade(l)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("failed to handle upgrade: %w", err))
+	}
+
 	// at this point the logger is working, so any errors that we hit can now be logged and returned
 	if len(errs) > 0 {
 		return logReturn(l, goerrors.Join(errs...))
@@ -244,7 +262,7 @@ func runElasticAgent(
 	baseLogger *logger.Logger,
 	l *logger.Logger,
 	cfg *configuration.Configuration,
-	override application.CfgOverrider,
+	override configuration.CfgOverrider,
 	stop chan bool,
 	testingMode bool,
 	fleetInitTimeout time.Duration,
@@ -345,6 +363,12 @@ func runElasticAgent(
 		return errors.New(err, "error migrating agent state")
 	}
 
+	// Reload in case migration wrote fleet.enc.
+	cfg, err = configuration.LoadConfig(ctx, override)
+	if err != nil {
+		return errors.New(err, "failed to reload configuration")
+	}
+
 	agentInfo, err := info.NewAgentInfoWithLog(ctx, defaultLogLevel(cfg, logLvl.String()), createAgentID)
 	if err != nil {
 		return errors.New(err,
@@ -358,7 +382,7 @@ func runElasticAgent(
 
 	// Ensure that the log level now matches what is configured in the agentInfo.
 	var lvl logp.Level
-	err = lvl.Unpack(agentInfo.LogLevel())
+	err = lvl.Unpack(agentInfo.GetLogLevelRuntime())
 	if err != nil {
 		l.Error(errors.New(err, "failed to parse agent information log level"))
 	} else {
@@ -399,7 +423,7 @@ func runElasticAgent(
 	availableRollbacksSource := ttl.NewTTLMarkerRegistry(l, paths.Top())
 
 	coord, configMgr, _, err := application.New(ctx, l, baseLogger, logLvl, agentInfo, rex, tracer, testingMode,
-		fleetInitTimeout, isBootstrap, override, initialUpgradeMarker, availableRollbacksSource, modifiers...)
+		fleetInitTimeout, isBootstrap, cfg, initialUpgradeMarker, availableRollbacksSource, modifiers...)
 	if err != nil {
 		return err
 	}
@@ -487,6 +511,7 @@ func runElasticAgent(
 	// listen for signals
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+	l.Debug("Registered signal handlers")
 	isRex := false
 	logShutdown := true
 LOOP:
@@ -536,35 +561,6 @@ LOOP:
 	return err
 }
 
-func loadConfig(ctx context.Context, override application.CfgOverrider) (*configuration.Configuration, error) {
-	pathConfigFile := paths.ConfigFile()
-	rawConfig, err := config.LoadFile(pathConfigFile)
-	if err != nil {
-		return nil, errors.New(err,
-			fmt.Sprintf("could not read configuration file %s", pathConfigFile),
-			errors.TypeFilesystem,
-			errors.M(errors.MetaKeyPath, pathConfigFile))
-	}
-
-	if err := getOverwrites(ctx, rawConfig); err != nil {
-		return nil, errors.New(err, "could not read overwrites")
-	}
-
-	cfg, err := configuration.NewFromConfig(rawConfig)
-	if err != nil {
-		return nil, errors.New(err,
-			fmt.Sprintf("could not parse configuration file %s", pathConfigFile),
-			errors.TypeFilesystem,
-			errors.M(errors.MetaKeyPath, pathConfigFile))
-	}
-
-	if override != nil {
-		override(cfg)
-	}
-
-	return cfg, nil
-}
-
 func reexecPath() (string, error) {
 	// set executable path to symlink instead of binary
 	// in case of updated symlinks we should spin up new agent
@@ -578,49 +574,25 @@ func reexecPath() (string, error) {
 	return potentialReexec, nil
 }
 
-func getOverwrites(ctx context.Context, rawConfig *config.Config) error {
-	cfg, err := configuration.NewFromConfig(rawConfig)
-	if err != nil {
-		return err
+// applyCustomLogsPath overrides the logging config to write to the user-specified
+// --path.logs location when that flag was explicitly set on the CLI. This ensures
+// the flag takes precedence over yaml settings such as agent.logging.to_stderr.
+// The internal file output (consumed by diagnostics) is always written to
+// paths.Home() and is unaffected.
+// See https://github.com/elastic/elastic-agent/issues/13320
+func applyCustomLogsPath(cfg *configuration.Configuration) {
+	if !paths.IsCustomLogsPath() {
+		return
 	}
-
-	if !cfg.Fleet.Enabled {
-		// overrides should apply only for fleet mode
-		return nil
+	if cfg.Settings.LoggingConfig != nil {
+		cfg.Settings.LoggingConfig.ToStderr = false
+		cfg.Settings.LoggingConfig.ToFiles = true
+		cfg.Settings.LoggingConfig.Files.Path = paths.Logs()
 	}
-	path := paths.AgentConfigFile()
-	store, err := storage.NewEncryptedDiskStore(ctx, path)
-	if err != nil {
-		return fmt.Errorf("error instantiating encrypted disk store: %w", err)
+	if cfg.Settings.EventLoggingConfig != nil {
+		cfg.Settings.EventLoggingConfig.ToStderr = false
+		cfg.Settings.EventLoggingConfig.ToFiles = true
 	}
-
-	reader, err := store.Load()
-	if err != nil && errors.Is(err, os.ErrNotExist) {
-		// no fleet file ignore
-		return nil
-	} else if err != nil {
-		return errors.New(err, "could not initialize config store",
-			errors.TypeFilesystem,
-			errors.M(errors.MetaKeyPath, path))
-	}
-
-	config, err := config.NewConfigFrom(reader)
-	if err != nil {
-		return errors.New(err,
-			fmt.Sprintf("fail to read configuration %s for the elastic-agent", path),
-			errors.TypeFilesystem,
-			errors.M(errors.MetaKeyPath, path))
-	}
-
-	err = rawConfig.Merge(config)
-	if err != nil {
-		return errors.New(err,
-			fmt.Sprintf("fail to merge configuration with %s for the elastic-agent", path),
-			errors.TypeConfig,
-			errors.M(errors.MetaKeyPath, path))
-	}
-
-	return nil
 }
 
 func defaultLogLevel(cfg *configuration.Configuration, currentLevel string) string {
@@ -638,7 +610,7 @@ func defaultLogLevel(cfg *configuration.Configuration, currentLevel string) stri
 	return ""
 }
 
-func tryDelayEnroll(ctx context.Context, logger *logger.Logger, cfg *configuration.Configuration, override application.CfgOverrider) (*configuration.Configuration, error) {
+func tryDelayEnroll(ctx context.Context, logger *logger.Logger, cfg *configuration.Configuration, override configuration.CfgOverrider) (*configuration.Configuration, error) {
 	enrollPath := paths.AgentEnrollFile()
 	if _, err := os.Stat(enrollPath); err != nil {
 		//nolint:nilerr // ignore the error, this is expected
@@ -664,6 +636,10 @@ func tryDelayEnroll(ctx context.Context, logger *logger.Logger, cfg *configurati
 	}
 	options.DelayEnroll = false
 	options.FleetServer.SpawnAgent = false
+	// Daemon mode: the enrollment token may be fixed externally (e.g. rotated
+	// secret) without restarting the agent, so we keep retrying instead of
+	// failing fast like the interactive `enroll` CLI does.
+	options.RetryOnInvalidToken = true
 	// enrollCmd daemonReloadWithBackoff is broken
 	// see https://github.com/elastic/elastic-agent/issues/4043
 	// SkipDaemonRestart to true avoids running that code.
@@ -688,19 +664,20 @@ func tryDelayEnroll(ctx context.Context, logger *logger.Logger, cfg *configurati
 	if err != nil {
 		return nil, err
 	}
-	// perform the enrollment in a loop, it should keep trying to enroll no matter what
-	// the enrollCmd has built in backoff so no need to wrap this in its own backoff as well
-	for {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		err = c.Execute(ctx, cli.NewIOStreams())
-		if err == nil {
-			// enrollment was successful
-			break
-		}
-		logger.Error(fmt.Errorf("failed to perform delayed enrollment (will try again): %w", err))
+
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
+
+	err = c.Execute(ctx, cli.NewIOStreams())
+	if err != nil {
+		return nil, errors.New(
+			err,
+			"failed to execute delayed enrollment",
+			errors.TypeApplication,
+			errors.M("path", enrollPath))
+	}
+
 	err = os.Remove(enrollPath)
 	if err != nil {
 		logger.Warn(errors.New(
@@ -710,7 +687,7 @@ func tryDelayEnroll(ctx context.Context, logger *logger.Logger, cfg *configurati
 			errors.M("path", enrollPath)))
 	}
 	logger.Info("Successfully performed delayed enrollment of this Elastic Agent.")
-	return loadConfig(ctx, override)
+	return configuration.LoadConfig(ctx, override)
 }
 
 func initTracer(agentName, version string, mcfg *monitoringCfg.MonitoringConfig) (*apm.Tracer, error) {
@@ -802,8 +779,8 @@ func setupMetrics(
 // handleUpgrade checks if agent is being run as part of an
 // ongoing upgrade operation, i.e. being re-exec'd and performs
 // any upgrade-specific work, if needed.
-func handleUpgrade() (*upgrade.UpdateMarker, error) {
-	upgradeMarker, err := upgrade.LoadMarker(paths.Data())
+func handleUpgrade(log *logger.Logger) (*upgrade.UpdateMarker, error) {
+	upgradeMarker, err := upgrade.TryLoadMarker(log, paths.Data())
 	if err != nil {
 		return nil, fmt.Errorf("unable to load upgrade marker to check if Agent is being upgraded: %w", err)
 	}
@@ -819,6 +796,27 @@ func handleUpgrade() (*upgrade.UpdateMarker, error) {
 
 	if err := upgrade.EnsureServiceConfigUpToDate(); err != nil {
 		return nil, err
+	}
+
+	// Update the Add/Remove Programs registry entry with the running version.
+	if err := install.UpsertUninstallEntry(paths.Top(), release.VersionWithSnapshot()); err != nil {
+		// Unprivileged upgrades from versions that predate the registry ACL change
+		// lack write access to HKLM. This is expected and can be resolved by
+		// running 'elastic-agent windows registry update'.
+		if goerrors.Is(err, os.ErrPermission) || strings.Contains(err.Error(), "Access is denied") {
+			log.Infof("insufficient permissions to update uninstall registry entry, can be fixed by running 'elastic-agent windows registry update'")
+		} else {
+			log.Warnf("failed to update uninstall registry entry: %v", err)
+		}
+	} else {
+		// MSI installations create their own entry with a version-specific ProductCode GUID,
+		// remove it to avoid a duplicate in Add/Remove Programs after upgrading from pre-9.4.0
+		prevVersion, parseErr := agtversion.ParseVersion(upgradeMarker.PrevVersion)
+		if parseErr == nil && prevVersion.Less(*upgrade.Version_9_4_0_SNAPSHOT) {
+			if err := install.RemoveMSIUninstallEntries(); err != nil {
+				log.Warnf("failed to remove MSI uninstall registry entries: %v", err)
+			}
+		}
 	}
 
 	return upgradeMarker, nil

@@ -24,12 +24,13 @@ import (
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/filelock"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade"
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/details"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/errors"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/install"
 	"github.com/elastic/elastic-agent/internal/pkg/cli"
 	"github.com/elastic/elastic-agent/internal/pkg/config"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
+	"github.com/elastic/elastic-agent/pkg/upgrade/details"
 	"github.com/elastic/elastic-agent/version"
 )
 
@@ -199,11 +200,10 @@ func watchCmd(log *logp.Logger, topDir string, cfg *configuration.UpgradeWatcher
 		// if we're not within grace and marker is still there it might mean
 		// that cleanup was not performed ok, cleanup everything except current version
 		// hash is the same as hash of agent which initiated watcher.
-		versionedHomesToKeep := make([]string, 0, len(marker.RollbacksAvailable)+1)
-		// current version needs to be kept
+		var versionedHomesToKeep []string
 		if marker.Details != nil && marker.Details.State == details.StateRollback {
 			// we need to keep the previous versioned home (we have rolled back)
-			versionedHomesToKeep = append(versionedHomesToKeep, marker.PrevVersionedHome)
+			versionedHomesToKeep = []string{marker.PrevVersionedHome}
 		} else {
 			// we need to keep the upgraded version, since it has not been rolled back
 			absCurrentVersionedHome := paths.VersionedHome(topDir)
@@ -211,12 +211,11 @@ func watchCmd(log *logp.Logger, topDir string, cfg *configuration.UpgradeWatcher
 			if err != nil {
 				return fmt.Errorf("extracting current home path %q relative to %q: %w", absCurrentVersionedHome, topDir, err)
 			}
-			versionedHomesToKeep = append(versionedHomesToKeep, currentVersionedHome)
+			versionedHomesToKeep = []string{currentVersionedHome}
 		}
 
-		versionedHomesToKeep = appendAvailableRollbacks(log, marker, versionedHomesToKeep)
 		log.Infof("About to clean up upgrade. Keeping versioned homes: %v", versionedHomesToKeep)
-		if err := installModifier.Cleanup(log, paths.Top(), true, false, versionedHomesToKeep...); err != nil {
+		if err := installModifier.Cleanup(log, paths.Top(), true /* removeMarker */, false /* keepLogs */, versionedHomesToKeep...); err != nil {
 			log.Error("clean up of prior watcher run failed", err)
 		}
 		// exit nicely
@@ -253,7 +252,19 @@ func watchCmd(log *logp.Logger, topDir string, cfg *configuration.UpgradeWatcher
 			// that agent was rolled back and the reason
 			removeMarker = false
 		}
-		err = installModifier.Rollback(ctx, log, client.New(), paths.Top(), marker.PrevVersionedHome, marker.PrevHash, WithRemoveMarker(removeMarker))
+
+		// remove the registry entry when rolling back to pre-9.4 agents that don't manage it,
+		// for >= 9.4 the old agent's handleUpgrade() will update it on restart
+		revertRegistryHook := func(ctx context.Context, log *logger.Logger, topDirPath string) error {
+			if versionParseErr == nil && previousVersion.Less(*semver.NewParsedSemVer(9, 4, 0, "SNAPSHOT", "")) {
+				if err := install.RemoveUninstallEntry(); err != nil {
+					log.Warnf("failed to remove uninstall registry entry during rollback: %v", err)
+				}
+			}
+			return nil
+		}
+
+		err = installModifier.Rollback(ctx, log, client.New(), paths.Top(), marker.PrevVersionedHome, marker.PrevHash, WithRemoveMarker(removeMarker), WithPreRestartHook(revertRegistryHook))
 		if err != nil {
 			log.Error("rollback failed", err)
 			upgradeDetails.Fail(err)
@@ -276,24 +287,13 @@ func watchCmd(log *logp.Logger, topDir string, cfg *configuration.UpgradeWatcher
 		// the upgrade marker may have been created by an older version of agent where the versionedHome is always `data/elastic-agent-<shortHash>`
 		newVersionedHome = filepath.Join("data", fmt.Sprintf("elastic-agent-%s", marker.Hash[:6]))
 	}
-	versionedHomesToKeep := make([]string, 0, len(marker.RollbacksAvailable)+1)
-	versionedHomesToKeep = append(versionedHomesToKeep, newVersionedHome)
-	versionedHomesToKeep = appendAvailableRollbacks(log, marker, versionedHomesToKeep)
-
-	err = installModifier.Cleanup(log, topDir, removeMarker, false, versionedHomesToKeep...)
+	// Only newVersionedHome is explicitly kept here; rollback candidates are preserved by
+	// cleanupAgentDirectories reading the TTL registry and retaining unexpired entries.
+	err = installModifier.Cleanup(log, topDir, removeMarker, false /* keepLogs */, newVersionedHome)
 	if err != nil {
 		log.Error("cleanup after successful watch failed", err)
 	}
 	return err
-}
-
-func appendAvailableRollbacks(log *logp.Logger, marker *upgrade.UpdateMarker, versionedHomesToKeep []string) []string {
-	// add any available rollbacks
-	for versionedHome, ra := range marker.RollbacksAvailable {
-		log.Debugf("Adding available rollback %s:%+v to the directories to keep during cleanup", versionedHome, ra)
-		versionedHomesToKeep = append(versionedHomesToKeep, versionedHome)
-	}
-	return versionedHomesToKeep
 }
 
 func rollback(log *logp.Logger, topDir string, client client.Client, installModifier installationModifier, versionedHome string) error {

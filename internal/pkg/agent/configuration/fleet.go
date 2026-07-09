@@ -11,6 +11,18 @@ import (
 	"github.com/elastic/elastic-agent/internal/pkg/remote"
 )
 
+const (
+	// CheckinCompressionNone disables checkin request compression.
+	CheckinCompressionNone = "none"
+	// CheckinCompressionGzip enables gzip compression of checkin requests.
+	CheckinCompressionGzip = "gzip"
+
+	defaultCompression = CheckinCompressionGzip
+
+	FleetCheckinModeStandard      = "standard"
+	FleetCheckinModeOnStateChange = "on_state_change"
+)
+
 // FleetAgentConfig is the internal configuration of the agent after the enrollment is done,
 // this configuration is not exposed in anyway in the elastic-agent.yml and is only internal configuration.
 type FleetAgentConfig struct {
@@ -54,7 +66,7 @@ func DefaultFleetAgentConfig() *FleetAgentConfig {
 		Enabled: false,
 		Client:  remote.DefaultClientConfig(),
 		Info:    &AgentInfo{},
-		Checkin: nil,
+		Checkin: DefaultFleetCheckin(),
 	}
 }
 
@@ -62,15 +74,25 @@ type FleetCheckin struct {
 	Mode               string        `config:"mode" yaml:"mode,omitempty"` // `standard` or `on_state_change` (empty string is accepted as standard)
 	RequestBackoffInit time.Duration `config:"request_backoff_init" yaml:"request_backoff_init,omitempty"`
 	RequestBackoffMax  time.Duration `config:"request_backoff_max" yaml:"request_backoff_max,omitempty"`
+	// Compression controls how checkin request bodies are encoded.
+	// Accepted values: "none" (no compression) or "gzip" (gzip compression).
+	Compression string `config:"compression" yaml:"compression,omitempty"`
+}
+
+// DefaultFleetCheckin returns a FleetCheckin with default values.
+func DefaultFleetCheckin() *FleetCheckin {
+	return &FleetCheckin{
+		Compression: defaultCompression,
+	}
 }
 
 func (f *FleetCheckin) IsModeOnStateChanged() bool {
-	return f != nil && f.Mode == fleetCheckinModeOnStateChanged
+	return f != nil && f.Mode == FleetCheckinModeOnStateChange
 }
 
 func (f *FleetCheckin) GetMode() string {
 	if f == nil || f.Mode == "" {
-		return fleetCheckinModeStandard
+		return FleetCheckinModeStandard
 	}
 
 	return f.Mode
@@ -81,17 +103,25 @@ func (f *FleetCheckin) Validate() error {
 		return nil
 	}
 
-	if f.Mode != "" && f.Mode != fleetCheckinModeStandard && f.Mode != fleetCheckinModeOnStateChanged {
+	if f.Mode != "" && f.Mode != FleetCheckinModeStandard && f.Mode != FleetCheckinModeOnStateChange {
 		return errors.New("checkin.mode must be either 'standard' or 'on_state_change'")
 	}
 
 	if f.RequestBackoffMax < f.RequestBackoffInit {
 		return errors.New("checkin.request_backoff_max must be greater than or equal to checkin.request_backoff_init")
 	}
+
+	if f.Compression != "" && f.Compression != CheckinCompressionNone && f.Compression != CheckinCompressionGzip {
+		return errors.New("checkin.compression must be either 'none' or 'gzip'")
+	}
+
 	return nil
 }
 
-const (
-	fleetCheckinModeStandard       = "standard"
-	fleetCheckinModeOnStateChanged = "on_state_change"
-)
+// GetCompression returns the configured compression mode, defaulting to gzip.
+func (f *FleetCheckin) GetCompression() string {
+	if f == nil || f.Compression == "" {
+		return defaultCompression
+	}
+	return f.Compression
+}

@@ -14,7 +14,6 @@ import (
 	koanfmaps "github.com/knadh/koanf/maps"
 
 	"github.com/elastic/elastic-agent-client/v7/pkg/client"
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/monitoring/monitoringhelpers"
 
 	"github.com/elastic/elastic-agent-libs/logp"
 
@@ -23,7 +22,7 @@ import (
 	"go.opentelemetry.io/collector/pipeline"
 	"golang.org/x/exp/maps"
 
-	fbfeatures "github.com/elastic/beats/v7/filebeat/features"
+	fbfeatures "github.com/elastic/beats/v7/libbeat/features"
 	"github.com/elastic/beats/v7/libbeat/outputs/elasticsearch"
 	"github.com/elastic/beats/v7/x-pack/libbeat/management"
 	"github.com/elastic/beats/v7/x-pack/otel/extension/beatsauthextension"
@@ -46,10 +45,10 @@ const (
 	elasticsearchStateStoreExtensionName  = "elasticsearch_storage"
 )
 
-// BeatMonitoringConfigGetter is a function that returns the monitoring configuration for a beat receiver.
 type (
-	BeatMonitoringConfigGetter    func(unitID, binary string) map[string]any
-	exporterConfigTranslationFunc func(*config.C, *logp.Logger) (map[string]any, error)
+	// exporter translation logic takes output config, output name, logger
+	// and returns exporter config, processor config (if any) and error
+	exporterConfigTranslationFunc func(*config.C, string, *logp.Logger) (map[string]any, map[string]any, error)
 )
 
 var (
@@ -67,7 +66,6 @@ var (
 func GetOtelConfig(
 	model *component.Model,
 	info info.Agent,
-	beatMonitoringConfigGetter BeatMonitoringConfigGetter,
 	logger *logp.Logger,
 ) (*confmap.Conf, error) {
 	components := getSupportedComponents(logger, model)
@@ -77,8 +75,12 @@ func GetOtelConfig(
 	otelConfig := confmap.New()     // base config, nothing here for now
 	extensions := map[string]bool{} // we have to manually handle extensions because otel does not merge lists, it overrides them. This is a known issue: see https://github.com/open-telemetry/opentelemetry-collector/issues/8754
 
+	// Evaluate the FQDN feature flag once, so every component in this render sees a consistent
+	// value even if the global flag changes (via a concurrent policy update) while we iterate.
+	fqdnEnabled := features.FQDN()
+
 	for _, comp := range components {
-		componentConfig, compErr := getCollectorConfigForComponent(comp, info, beatMonitoringConfigGetter, logger)
+		componentConfig, compErr := getCollectorConfigForComponent(comp, info, fqdnEnabled, logger)
 		if compErr != nil {
 			return nil, compErr
 		}
@@ -112,21 +114,6 @@ func GetOtelConfig(
 		err := otelConfig.Merge(extensionsConf)
 		if err != nil {
 			return nil, fmt.Errorf("error merging otel extensions: %w", err)
-		}
-	}
-
-	// If the default_processors feature flag is enabled, add a single shared
-	// beat processor definition that all pipelines reference.
-	if features.DefaultProcessors() {
-		processorConf := confmap.NewFromStringMap(map[string]any{
-			"processors": map[string]any{
-				GetProcessorID().String(): map[string]any{
-					"processors": GetDefaultProcessors(),
-				},
-			},
-		})
-		if mergeErr := otelConfig.Merge(processorConf); mergeErr != nil {
-			return nil, fmt.Errorf("error merging beat processor config: %w", mergeErr)
 		}
 	}
 
@@ -172,9 +159,7 @@ func VerifyComponentIsOtelSupported(comp *component.Component) error {
 
 	// check if the actual configuration is supported. We need to actually generate the config and look for
 	// the right kind of error
-	_, compErr := getCollectorConfigForComponent(comp, &info.AgentInfo{}, func(unitID, binary string) map[string]any {
-		return nil
-	}, logp.NewNopLogger())
+	_, compErr := getCollectorConfigForComponent(comp, &info.AgentInfo{}, features.FQDN(), logp.NewNopLogger())
 	if errors.Is(compErr, errors.ErrUnsupported) {
 		return fmt.Errorf("unsupported configuration for %s: %w", comp.ID, compErr)
 	}
@@ -198,7 +183,7 @@ func VerifyOutputIsOtelSupported(outputType string, outputCfg map[string]any) er
 		return err
 	}
 
-	_, err = OutputConfigToExporterConfig(logp.NewNopLogger(), exporterType, outputCfgC)
+	_, _, err = OutputConfigToExporterConfig(logp.NewNopLogger(), exporterType, outputCfgC, "")
 	if errors.Is(err, errors.ErrUnsupported) {
 		return fmt.Errorf("unsupported configuration for %s: %w", outputType, err)
 	}
@@ -243,9 +228,13 @@ func GetExporterID(exporterType otelcomponent.Type, outputName string) otelcompo
 	return otelcomponent.NewIDWithName(exporterType, exporterName)
 }
 
-// GetProcessorID returns the shared beat processor id used across all pipelines.
-func GetProcessorID() otelcomponent.ID {
-	return otelcomponent.NewIDWithName(otelcomponent.MustNewType("beat"), strings.TrimSuffix(OtelNamePrefix, "/"))
+// GetProcessorID returns the beat processor id for the given name. Each pipeline
+// gets its own processor, since default processors can differ by beat; the
+// beatsprocessor implementation shares state internally between instances that
+// end up with identical configuration.
+func GetProcessorID(name string) otelcomponent.ID {
+	processorName := fmt.Sprintf("%s%s", OtelNamePrefix, name)
+	return otelcomponent.NewIDWithName(otelcomponent.MustNewType("beat"), processorName)
 }
 
 // getBeatsAuthExtensionID returns the id for beatsauth extension
@@ -255,13 +244,20 @@ func getBeatsAuthExtensionID(outputName string) otelcomponent.ID {
 	return otelcomponent.NewIDWithName(otelcomponent.MustNewType(BeatsAuthExtensionType), extensionName)
 }
 
+// getKafkaPartitionerExtensionID returns the id for kafkapartitioner extension
+// outputName here is name of the output defined in elastic-agent.yml. For ex: default, monitoring
+func getKafkaPartitionerExtensionID(outputName string) otelcomponent.ID {
+	extensionName := fmt.Sprintf("%s%s", OtelNamePrefix, outputName)
+	return otelcomponent.NewIDWithName(otelcomponent.MustNewType("kafkapartitioner"), extensionName)
+}
+
 // getCollectorConfigForComponent returns the Otel collector config required to run the given component.
 // This function returns a full, valid configuration that can then be merged with configurations for other components.
 // Note: Lists are not merged and should be handled by the caller of the method
 func getCollectorConfigForComponent(
 	comp *component.Component,
 	info info.Agent,
-	beatMonitoringConfigGetter BeatMonitoringConfigGetter,
+	fqdnEnabled bool,
 	logger *logp.Logger,
 ) (*confmap.Conf, error) {
 	exporterType, err := OutputTypeToExporterType(comp.OutputType)
@@ -269,11 +265,11 @@ func getCollectorConfigForComponent(
 		return nil, err
 	}
 	exporterID := GetExporterID(exporterType, comp.OutputName)
-	exporterConfig, outputQueueConfig, extensionConfig, processors, err := getExporterConfigForComponent(comp, exporterType, logger)
+	exporterConfig, outputQueueConfig, extensionConfig, processorConfig, err := getExporterConfigForComponent(comp, exporterType, logger)
 	if err != nil {
 		return nil, err
 	}
-	receiversConfig, err := getReceiversConfigForComponent(comp, info, outputQueueConfig, beatMonitoringConfigGetter)
+	receiversConfig, err := getReceiversConfigForComponent(comp, info, fqdnEnabled, outputQueueConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -282,18 +278,45 @@ func getCollectorConfigForComponent(
 		return nil, err
 	}
 
+	receiverKeys := maps.Keys(receiversConfig)
+	slices.Sort(receiverKeys)
 	pipelineConfig := map[string][]string{
 		"exporters": {exporterID.String()},
-		"receivers": maps.Keys(receiversConfig),
+		"receivers": receiverKeys,
 	}
 
-	// Build the pipeline processors list: the shared beat processor first (if enabled),
-	// followed by any per-output processors defined in the output configuration.
+	// Build the pipeline processors list: this component's own default beat processor
+	// first (if enabled and its beat has any default processors), then per-output
+	// processors from config, then any other processors from processorConfig (e.g. Kafka transform).
+	// Each pipeline gets its own default-processor definition (scoped by comp.ID) rather
+	// than sharing one across all pipelines, since different beats can have different
+	// default processors.
+	beatDefaultProcessors := GetDefaultProcessors(comp.BeatName())
+	beatProcessorID := GetProcessorID(comp.ID).String()
 	var pipelineProcessors []string
-	if features.DefaultProcessors() {
-		pipelineProcessors = append(pipelineProcessors, GetProcessorID().String())
+	if features.DefaultProcessors() && len(beatDefaultProcessors) > 0 {
+		pipelineProcessors = append(pipelineProcessors, beatProcessorID)
 	}
+
+	// per output processor if any
+	processors, err := extractOtelProcessors(comp)
+	if err != nil {
+		return nil, fmt.Errorf("could not read per output processor: %w", err)
+	}
+
 	pipelineProcessors = append(pipelineProcessors, processors...)
+
+	if len(processorConfig) != 0 {
+		// Note: processorConfig should be applied in a deterministic order.
+		// Since only a single processor is ever returned from the exporter config, we ignore the ordering
+
+		if len(processorConfig) > 1 { // Ideally this never happens but it guards any future changes
+			return nil, fmt.Errorf("found more than one processor config")
+		}
+
+		pipelineProcessors = append(pipelineProcessors, maps.Keys(processorConfig)...)
+	}
+
 	if len(pipelineProcessors) > 0 {
 		pipelineConfig["processors"] = pipelineProcessors
 	}
@@ -326,16 +349,30 @@ func getCollectorConfigForComponent(
 		}
 	}
 
+	allProcessorsConfig := map[string]any{}
+	for k, v := range processorConfig {
+		allProcessorsConfig[k] = v
+	}
+	if features.DefaultProcessors() && len(beatDefaultProcessors) > 0 {
+		allProcessorsConfig[beatProcessorID] = map[string]any{
+			"processors": beatDefaultProcessors,
+		}
+	}
+	if len(allProcessorsConfig) > 0 {
+		fullConfig["processors"] = allProcessorsConfig
+	}
+
 	return confmap.NewFromStringMap(fullConfig), nil
 }
 
-// getReceiversConfigForComponent returns the receivers configuration for a component. Usually this will be a single
-// receiver, but in principle it could be more.
+// getReceiversConfigForComponent returns the receivers configuration for a component.
+// By default each input stream produces its own receiver. When the component's InputSpec has
+// SingleReceiver set, all streams are merged into one receiver keyed by component ID alone.
 func getReceiversConfigForComponent(
 	comp *component.Component,
 	info info.Agent,
+	fqdnEnabled bool,
 	outputQueueConfig map[string]any,
-	beatMonitoringConfigGetter BeatMonitoringConfigGetter,
 ) (map[string]any, error) {
 	receiverType, err := getReceiverTypeForComponent(comp)
 	if err != nil {
@@ -348,11 +385,10 @@ func getReceiversConfigForComponent(
 	}
 
 	// get inputs for all the units
-	// we run a single receiver for each component to mirror what beats processes do
-	var inputs []map[string]any
+	var inputs []receiverInput
 	for _, unit := range comp.Units {
 		if unit.Type == client.UnitTypeInput {
-			unitInputs, err := getInputsForUnit(unit, info, defaultDataStreamType, comp.InputType)
+			unitInputs, err := getInputsForUnit(unit, info, defaultDataStreamType, comp)
 			if err != nil {
 				return nil, err
 			}
@@ -360,14 +396,14 @@ func getReceiversConfigForComponent(
 		}
 	}
 
-	receiverId := GetReceiverID(receiverType, comp.ID)
 	// Beat config inside a beat receiver is nested under an additional key. Not sure if this simple translation is
 	// always safe. We should either ensure this is always the case, or have an explicit mapping.
 	beatName := strings.TrimSuffix(receiverType.String(), "receiver")
 	binaryName := comp.BeatName()
 	dataset := fmt.Sprintf("elastic_agent.%s", strings.ReplaceAll(strings.ReplaceAll(binaryName, "-", "_"), "/", "_"))
 
-	receiverConfig := map[string]any{
+	// Build the shared receiver config (same for all receivers in this component)
+	sharedConfig := map[string]any{
 		// just like we do for beats processes, each receiver needs its own data path
 		"path": map[string]any{
 			"home": paths.Components(),
@@ -388,52 +424,96 @@ func getReceiversConfigForComponent(
 			},
 		},
 	}
-	switch beatName {
-	case "filebeat":
-		receiverConfig[beatName] = map[string]any{
-			"inputs": inputs,
-		}
-		if fbfeatures.IsElasticsearchStateStoreEnabled() {
-			receiverConfig["storage"] = elasticsearchStateStoreExtensionName
-		}
-	case "metricbeat":
-		receiverConfig[beatName] = map[string]any{
-			"modules": inputs,
-		}
-	}
 	// add the output queue config if present
 	if outputQueueConfig != nil {
-		receiverConfig["queue"] = outputQueueConfig
+		sharedConfig["queue"] = outputQueueConfig
 	}
 
-	// add monitoring config if necessary
-	// we enable the basic monitoring endpoint by default, because we want to use it for diagnostics even if
-	// agent self-monitoring is disabled
-	var monitoringConfig map[string]any
-	if beatMonitoringConfigGetter != nil {
-		monitoringConfig = beatMonitoringConfigGetter(comp.ID, beatName)
+	// Disable the HTTP monitoring endpoint for beat receivers running inside the
+	// OTel collector. Their metrics are collected via the elasticmonitoring receiver
+	// through OTel internal telemetry, so no scraping is needed.
+	sharedConfig["http"] = map[string]any{
+		"enabled": false,
 	}
 
-	if monitoringConfig == nil {
-		endpoint := monitoringhelpers.BeatsMonitoringEndpoint(comp.ID)
-		monitoringConfig = map[string]any{
-			"http": map[string]any{
-				"enabled": true,
-				"host":    endpoint,
-			},
-		}
+	if comp.OutputType == "kafka" || comp.OutputType == "logstash" {
+		sharedConfig["include_metadata"] = true
 	}
+	if beatName == "filebeat" && fbfeatures.IsElasticsearchStateStoreEnabled() {
+		sharedConfig["storage"] = elasticsearchStateStoreExtensionName
+	}
+
 	// indicate that beat receivers are managed by the elastic-agent
-	receiverConfig["management.otel.enabled"] = true
-	koanfmaps.Merge(monitoringConfig, receiverConfig)
+	sharedConfig["management.otel.enabled"] = true
 
-	return map[string]any{
-		receiverId.String(): receiverConfig,
-	}, nil
+	// propagate the FQDN feature flag into the receiver config
+	sharedConfig["features"] = map[string]any{
+		"fqdn": map[string]any{
+			"enabled": fqdnEnabled,
+		},
+	}
+
+	// When SingleReceiver is set, merge all stream inputs into one receiver keyed by
+	// component ID instead of creating one receiver per stream. Some components have
+	// shared state that cannot easily be split across receivers.
+	if comp.InputSpec != nil && comp.InputSpec.Spec.SingleReceiver {
+		allInputConfigs := make([]map[string]any, 0, len(inputs))
+		for _, ri := range inputs {
+			allInputConfigs = append(allInputConfigs, ri.config)
+		}
+		receiverID := GetReceiverID(receiverType, comp.ID)
+		receiverConfig := maps.Clone(sharedConfig)
+		receiverConfig[beatName] = map[string]any{
+			beatInputsKey(beatName): allInputConfigs,
+		}
+		return map[string]any{receiverID.String(): receiverConfig}, nil
+	}
+
+	// Create one receiver per input stream.
+	receiversConfig := make(map[string]any, len(inputs))
+	for _, ri := range inputs {
+		if ri.streamID == "" {
+			return nil, fmt.Errorf("input missing stream ID in component %s", comp.ID)
+		}
+		receiverID := GetReceiverID(receiverType, comp.ID+"/"+ri.streamID)
+
+		// Create a new config map for this receiver, copying shared config entries.
+		// This is a shallow copy — nested map values (path, logging, http) are shared
+		// across receivers. This is safe because nothing mutates them after construction.
+		receiverConfig := maps.Clone(sharedConfig)
+		receiverConfig[beatName] = map[string]any{
+			beatInputsKey(beatName): []map[string]any{ri.config},
+		}
+		receiversConfig[receiverID.String()] = receiverConfig
+	}
+
+	return receiversConfig, nil
 }
 
-// GetDefaultProcessors returns the default beat processors used across all pipelines.
-func GetDefaultProcessors() []map[string]any {
+// beatInputsKey returns the config key used to pass inputs/modules/monitors/protocols
+// to each beat type inside its receiver config. Each beat nests its stream configuration
+// under a beat-specific key (e.g. filebeat.inputs, metricbeat.modules, heartbeat.monitors).
+func beatInputsKey(beatName string) string {
+	switch beatName {
+	case "metricbeat", "auditbeat":
+		return "modules"
+	case "heartbeat":
+		return "monitors"
+	case "packetbeat":
+		return "protocols"
+	default:
+		// filebeat, osquerybeat, and any future beats use "inputs"
+		return "inputs"
+	}
+}
+
+// GetDefaultProcessors returns the default processors for the given beat.
+// These mirror the fleetDefaultProcessors that each beat sets for process mode.
+// Heartbeat sets fleetDefaultProcessors=nil, so it gets no default processors.
+func GetDefaultProcessors(beatName string) []map[string]any {
+	if beatName == "heartbeat" {
+		return nil
+	}
 	return []map[string]any{
 		{
 			"add_host_metadata": map[string]any{
@@ -449,13 +529,16 @@ func GetDefaultProcessors() []map[string]any {
 // getExporterConfigForComponent returns the exporter configuration and queue settings for a component. Note that a
 // valid component is always created from a single output config, so there should only be one output unit per
 // component; if there is more than one, this function returns the first.
-func getExporterConfigForComponent(comp *component.Component, exporterType otelcomponent.Type, logger *logp.Logger) (exporterCfg map[string]any, queueCfg map[string]any, extensionCfg map[string]any, processors []string, err error) {
-	for _, unit := range comp.Units {
-		if unit.Type == client.UnitTypeOutput {
-			return unitToExporterConfig(unit, comp.OutputName, exporterType, logger)
-		}
+func getExporterConfigForComponent(comp *component.Component, exporterType otelcomponent.Type, logger *logp.Logger) (
+	exporterCfg map[string]any,
+	queueCfg map[string]any,
+	extensionCfg map[string]any,
+	processors map[string]any, err error) {
+	outputUnit, ok := comp.OutputUnit()
+	if !ok {
+		return nil, nil, nil, nil, nil
 	}
-	return nil, nil, nil, nil, nil
+	return unitToExporterConfig(outputUnit, comp.OutputName, exporterType, logger)
 }
 
 // getSignalForComponent returns the otel signal for the given component. Currently, this is always logs, even for
@@ -463,7 +546,7 @@ func getExporterConfigForComponent(comp *component.Component, exporterType otelc
 func getSignalForComponent(comp *component.Component) (pipeline.Signal, error) {
 	beatName := comp.BeatName()
 	switch beatName {
-	case "filebeat", "metricbeat":
+	case "filebeat", "metricbeat", "auditbeat", "heartbeat", "osquerybeat", "packetbeat":
 		return pipeline.SignalLogs, nil
 	default:
 		return pipeline.Signal{}, fmt.Errorf("unknown otel signal for input type: %s", comp.InputType)
@@ -474,10 +557,8 @@ func getSignalForComponent(comp *component.Component) (pipeline.Signal, error) {
 func getReceiverTypeForComponent(comp *component.Component) (otelcomponent.Type, error) {
 	beatName := comp.BeatName()
 	switch beatName {
-	case "filebeat":
-		return otelcomponent.MustNewType("filebeatreceiver"), nil
-	case "metricbeat":
-		return otelcomponent.MustNewType("metricbeatreceiver"), nil
+	case "filebeat", "metricbeat", "auditbeat", "heartbeat", "osquerybeat", "packetbeat":
+		return otelcomponent.MustNewType(beatName + "receiver"), nil
 	default:
 		return otelcomponent.Type{}, fmt.Errorf("unknown otel receiver type for input type: %s", comp.InputType)
 	}
@@ -502,9 +583,13 @@ func OutputTypeToExporterType(outputType string) (otelcomponent.Type, error) {
 // - exportersCfg: OTel exporter configuration
 // - queueSettings: the output's queue configuration
 // - extensionCfg: OTel extension configuration, or nil if not needed for the exporter
-// - processors: list of OTel processor IDs defined in the output, or nil if the output does not define any
+// - processorCfg: OTel processor configuration or nil if not needed for the exporter
 // - err: the error, if any
-func unitToExporterConfig(unit component.Unit, outputName string, exporterType otelcomponent.Type, logger *logp.Logger) (exportersCfg map[string]any, queueSettings map[string]any, extensionCfg map[string]any, processors []string, err error) {
+func unitToExporterConfig(unit component.Unit, outputName string, exporterType otelcomponent.Type, logger *logp.Logger) (
+	exportersCfg map[string]any,
+	queueSettings map[string]any,
+	extensionCfg map[string]any,
+	processorCfg map[string]any, err error) {
 	if unit.Type == client.UnitTypeInput {
 		return nil, nil, nil, nil, fmt.Errorf("unit type is an input, expected output: %v", unit)
 	}
@@ -516,11 +601,6 @@ func unitToExporterConfig(unit component.Unit, outputName string, exporterType o
 		return nil, nil, nil, nil, fmt.Errorf("error translating config for output: %s, unit: %s, error: %w", outputName, unit.ID, err)
 	}
 
-	processors, err = extractOtelProcessors(outputCfgC)
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("error translating processors config for output: %s, unit: %s, error: %w", outputName, unit.ID, err)
-	}
-
 	// if there's an otel override config, extract it, we'll apply it after the conversion
 	otelOverrideCfgC, err := extractOutputOtelOverrideConfig(outputCfgC)
 	if err != nil {
@@ -528,7 +608,7 @@ func unitToExporterConfig(unit component.Unit, outputName string, exporterType o
 	}
 
 	// Config translation function can mutate queue settings defined under output config
-	exporterConfig, err := OutputConfigToExporterConfig(logger, exporterType, outputCfgC)
+	exporterConfig, processorConfig, err := OutputConfigToExporterConfig(logger, exporterType, outputCfgC, outputName)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("error translating config for output: %s, unit: %s, error: %w", outputName, unit.ID, err)
 	}
@@ -584,14 +664,51 @@ func unitToExporterConfig(unit component.Unit, outputName string, exporterType o
 			// The state store extension will pick up relevant settings from it and ignore the rest.
 			extensionCfg[elasticsearchStateStoreExtensionName] = unitConfigMap
 		}
+	} else if exporterType.String() == "kafka" {
+		extensionID := getKafkaPartitionerExtensionID(outputName)
+		extensionCfg = map[string]any{}
+		partitioner, ok := unitConfigMap["partition"]
+		if ok {
+			extensionCfg[extensionID.String()] = partitioner
+		} else {
+			// Specifying empty map will make the extension use the default hash partitioner.
+			extensionCfg[extensionID.String()] = map[string]any{}
+		}
+		exporterConfig["record_partitioner"] = map[string]any{
+			"extension": extensionID.String(),
+		}
 	}
 
-	return exporterConfig, queueSettings, extensionCfg, processors, nil
+	return exporterConfig, queueSettings, extensionCfg, processorConfig, nil
 }
 
 // getInputsForUnit returns the beat inputs for a unit. These can directly be plugged into a beats receiver config.
 // It mainly calls a conversion function from the control protocol client.
-func getInputsForUnit(unit component.Unit, info info.Agent, defaultDataStreamType string, inputType string) ([]map[string]any, error) {
+// receiverInput pairs a beat input config with its authoritative stream ID.
+// The stream ID comes from the proto Stream.Id field and is used as the receiver
+// name suffix. It is kept separate from the input map because not all input types
+// (e.g. metricbeat modules) carry "id" in their source config.
+type receiverInput struct {
+	streamID string
+	config   map[string]any
+}
+
+// resolveStreamID returns the canonical stream ID for a given proto stream, unit ID,
+// and stream index. It follows the same fallback chain used when naming per-stream
+// receivers: proto Stream.Id → stream source "id" field → generated ID from unit ID
+// and index. Both the receiver naming (otelconfig.go) and status lookup (status.go)
+// must use this function to stay in sync.
+func resolveStreamID(streamID string, streamSource map[string]any, unitID string, index int) string {
+	if streamID != "" {
+		return streamID
+	}
+	if id, ok := streamSource["id"].(string); ok && id != "" {
+		return id
+	}
+	return fmt.Sprintf("%s-%d", unitID, index)
+}
+
+func getInputsForUnit(unit component.Unit, info info.Agent, defaultDataStreamType string, comp *component.Component) ([]receiverInput, error) {
 	agentInfo := &client.AgentInfo{
 		ID:           info.AgentID(),
 		Version:      info.Version(),
@@ -599,27 +716,102 @@ func getInputsForUnit(unit component.Unit, info info.Agent, defaultDataStreamTyp
 		ManagedMode:  runtime.ProtoAgentMode(info),
 		Unprivileged: info.Unprivileged(),
 	}
-	inputs, err := management.CreateInputsFromStreams(unit.Config, defaultDataStreamType, agentInfo)
+	inputs, err := management.CreateInputsFromStreamsForReceiver(unit.Config, defaultDataStreamType, agentInfo)
 	if err != nil {
 		return nil, err
 	}
-	// Add the type to each input. CreateInputsFromStreams doesn't do this, each beat does it on its own in a transform
-	// function. For filebeat, see: https://github.com/elastic/beats/blob/main/x-pack/filebeat/cmd/agent.go
 
-	for _, input := range inputs {
-		// If inputType contains /metrics, use modules to create inputs
-		if strings.Contains(inputType, "/metrics") {
-			input["module"] = strings.TrimSuffix(inputType, "/metrics")
-		} else if _, ok := input["type"]; !ok {
-			input["type"] = inputType
+	// Build the stream ID list from the proto. CreateInputsFromStreamsForReceiver
+	// returns one input per stream in order, so we can zip them together.
+	streams := unit.Config.GetStreams()
+
+	// Handle input types that are namespaced to their component type by either a prefix or suffix.
+	// CreateInputsFromStreams doesn't do this, each beat does it on its own in a transform
+	// function. For filebeat, see: https://github.com/elastic/beats/blob/main/x-pack/filebeat/cmd/agent.go
+	inputTypePrefix, inputTypeSuffix, inputTypeHasSlash := strings.Cut(comp.InputType, "/")
+	result := make([]receiverInput, len(inputs))
+	for i, input := range inputs {
+		switch {
+		case inputTypeHasSlash && inputTypeSuffix == "metrics":
+			// metricbeat: "system/metrics" → "module: system" per https://www.elastic.co/docs/reference/beats/metricbeat/configuration-metricbeat
+			input["module"] = inputTypePrefix
+		case inputTypeHasSlash && inputTypePrefix == "audit":
+			// auditbeat: "audit/auditd" → "module: auditd" per https://www.elastic.co/docs/reference/beats/auditbeat/configuration-auditbeat
+			if _, ok := input["module"]; !ok {
+				input["module"] = inputTypeSuffix
+			}
+		case inputTypeHasSlash && inputTypePrefix == "synthetics":
+			// heartbeat: "synthetics/http" → "type: http" per https://www.elastic.co/docs/reference/beats/heartbeat/configuration-heartbeat-options
+			if _, ok := input["type"]; !ok {
+				input["type"] = inputTypeSuffix
+			}
+		default:
+			if _, ok := input["type"]; !ok {
+				input["type"] = comp.InputType
+			}
 		}
+
+		var protoStreamID string
+		if i < len(streams) {
+			protoStreamID = streams[i].GetId()
+		}
+		streamID := resolveStreamID(protoStreamID, input, unit.ID, i)
+		result[i] = receiverInput{streamID: streamID, config: input}
 	}
 
-	return inputs, nil
+	if comp.InputSpec != nil && comp.InputSpec.Spec.SingleReceiver && comp.InputType == "osquery" {
+		result = injectOsqueryConfig(result, unit)
+	}
+
+	return result, nil
+}
+
+// injectOsqueryConfig replicates what osquerybeatCfgFromStreams does in process
+// mode: it attaches the input-level "osquery" field (schedule, packs, decorators,
+// etc.) to the osquery_manager.result stream and moves that stream to position 0
+// so that inputs[0].Osquery is non-nil when config_plugin.Set() reads it at
+// beat startup.
+func injectOsqueryConfig(result []receiverInput, unit component.Unit) []receiverInput {
+	// Mirror the implementation from https://github.com/elastic/beats/blob/7764586737b76758db262a06fb3c594c52185c48/x-pack/osquerybeat/cmd/root.go#L92
+	osqMap, ok := unit.Config.GetSource().AsMap()["osquery"].(map[string]any)
+	if !ok {
+		return result
+	}
+	for i, ri := range result {
+		// "osquery_manager.result" is the dataset of the stream that carries osquery
+		// scheduled query results and must receive the input-level osquery configuration.
+		datastream, ok := ri.config["data_stream"].(map[string]any)
+		if !ok {
+			continue
+		}
+		dataset, _ := datastream["dataset"].(string)
+		if dataset != "osquery_manager.result" {
+			continue
+		}
+		if _, exists := result[i].config["osquery"]; !exists {
+			// Clone before mutating so we don't modify the map returned by CreateInputsFromStreamsForReceiver.
+			result[i].config = maps.Clone(result[i].config)
+			result[i].config["osquery"] = osqMap
+		}
+		// Place the result stream first so inputs[0].Osquery is set.
+		result[0], result[i] = result[i], result[0]
+		break
+	}
+	return result
 }
 
 // extractOtelProcessors extracts the processor IDs from the output configuration.
-func extractOtelProcessors(outputConfig *config.C) ([]string, error) {
+func extractOtelProcessors(comp *component.Component) ([]string, error) {
+	outputUnit, ok := comp.OutputUnit()
+	if !ok {
+		return nil, nil
+	}
+	unitConfigMap := outputUnit.Config.GetSource().AsMap() // this is what beats do in libbeat/management/generate.go
+	outputConfig, err := config.NewConfigFrom(unitConfigMap)
+	if err != nil {
+		return nil, fmt.Errorf("error translating config for output: %s, unit: %s, error: %w", comp.OutputName, outputUnit.ID, err)
+	}
+
 	if !outputConfig.HasField("processors") {
 		return nil, nil
 	}
@@ -637,18 +829,23 @@ func extractOtelProcessors(outputConfig *config.C) ([]string, error) {
 }
 
 // OutputConfigToExporterConfig translates the output configuration to an exporter configuration.
-func OutputConfigToExporterConfig(logger *logp.Logger, exporterType otelcomponent.Type, outputConfig *config.C) (map[string]any, error) {
+// It can also return a processor configuration (if any)
+func OutputConfigToExporterConfig(logger *logp.Logger,
+	exporterType otelcomponent.Type,
+	outputConfig *config.C,
+	outputName string,
+) (map[string]any, map[string]any, error) {
 	configTranslationFunc, ok := configTranslationFuncForExporter[exporterType]
 	if !ok {
-		return nil, fmt.Errorf("no config translation function for exporter type: %s", exporterType)
+		return nil, nil, fmt.Errorf("no config translation function for exporter type: %s", exporterType)
 	}
 
-	exporterConfig, err := configTranslationFunc(outputConfig, logger)
+	exporterConfig, processorConfig, err := configTranslationFunc(outputConfig, outputName, logger)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return exporterConfig, nil
+	return exporterConfig, processorConfig, nil
 }
 
 // getDefaultDatastreamTypeForComponent returns the default datastream type for a given component.
@@ -656,7 +853,7 @@ func OutputConfigToExporterConfig(logger *logp.Logger, exporterType otelcomponen
 func getDefaultDatastreamTypeForComponent(comp *component.Component) (string, error) {
 	beatName := comp.BeatName()
 	switch beatName {
-	case "filebeat":
+	case "filebeat", "auditbeat", "heartbeat", "osquerybeat", "packetbeat":
 		return "logs", nil
 	case "metricbeat":
 		return "metrics", nil

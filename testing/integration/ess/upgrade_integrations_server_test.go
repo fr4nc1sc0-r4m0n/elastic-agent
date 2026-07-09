@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"sort"
 	"testing"
 	"time"
@@ -45,7 +46,7 @@ func TestUpgradeIntegrationsServer(t *testing.T) {
 		t.Fatal("ECH API key missing")
 	}
 
-	startVersions := getUpgradeableFIPSVersions(t)
+	startVersions := getUpgradeableFIPSVersions(t, runtime.GOOS, runtime.GOARCH)
 	endVersion := define.Version()
 
 	prov, err := ess.NewProvisioner(ess.ProvisionerConfig{
@@ -67,7 +68,7 @@ func TestUpgradeIntegrationsServer(t *testing.T) {
 		t.Run(fmt.Sprintf("%s_to_%s", startVersion.String(), endVersion), func(t *testing.T) {
 			// Create ECH deployment with start version
 			t.Logf("Creating ECH deployment with version [%s] in region [%s]", startVersion.String(), echRegion)
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
 			deployment, err := statefulProv.Create(ctx, common.StackRequest{
 				ID:      "it-upgrade-integrations-server",
@@ -94,32 +95,32 @@ func TestUpgradeIntegrationsServer(t *testing.T) {
 
 			// Check that deployment is ready and healthy after creation
 			t.Logf("Waiting for ECH deployment [%s] in region [%s] to be ready and healthy after creation", deployment.ID, echRegion)
-			deployment, err = prov.WaitForReady(context.Background(), deployment)
+			deployment, err = prov.WaitForReady(t.Context(), deployment)
 			require.NoError(t, err)
 
 			// Upgrade deployment to end version
 			t.Logf("Upgrading ECH deployment [%s] in region [%s] from version [%s] to [%s]", deployment.ID, echRegion, startVersion.String(), endVersion)
-			err = prov.Upgrade(context.Background(), deployment, endVersion)
+			err = prov.Upgrade(t.Context(), deployment, endVersion)
 			require.NoError(t, err)
 			deployment.Version = endVersion
 
 			// Check that deployment is ready and healthy after upgrade
 			t.Logf("Waiting for ECH deployment [%s] in region [%s] to be ready and healthy after upgrade", deployment.ID, echRegion)
-			deployment, err = prov.WaitForReady(context.Background(), deployment)
+			deployment, err = prov.WaitForReady(t.Context(), deployment)
 			require.NoError(t, err)
 		})
 	}
 }
 
 // getUpgradeableFIPSVersions returns stack versions to use as the start version for an upgrade.
-func getUpgradeableFIPSVersions(t *testing.T) version.SortableParsedVersions {
+func getUpgradeableFIPSVersions(t *testing.T, os, arch string) version.SortableParsedVersions {
 	versions, err := upgradetest.GetUpgradableVersions()
 	require.NoError(t, err, "could not get upgradable versions")
 
 	filteredVersions := make([]*version.ParsedSemVer, 0)
 	for _, ver := range versions {
 		// Filter out versions that are not FIPS-capable
-		if !isFIPSCapableVersion(ver) {
+		if !isFIPSCapableVersion(ver, os, arch) {
 			continue
 		}
 

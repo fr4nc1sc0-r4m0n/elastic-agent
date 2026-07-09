@@ -18,6 +18,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/elastic/elastic-agent-client/v7/pkg/client"
+	"github.com/elastic/elastic-agent-client/v7/pkg/proto"
 
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
 	"github.com/elastic/elastic-agent/pkg/component"
@@ -39,6 +40,12 @@ const (
 	stateUnknownMessage = "Unknown"
 )
 
+// Environment variables for agentless mode
+const (
+	isAgentlessEnvName          = "ELASTIC_AGENT_IS_AGENTLESS"
+	stateStoreInputTypesEnvName = "AGENTLESS_ELASTICSEARCH_STATE_STORE_INPUT_TYPES"
+)
+
 func (m actionMode) String() string {
 	switch m {
 	case actionStop:
@@ -48,6 +55,25 @@ func (m actionMode) String() string {
 	}
 	return ""
 }
+
+const (
+	// ShutdownBuffer is the time reserved for SIGKILL delivery, process reaping,
+	// and coordinator shutdown overhead. The SIGTERM grace period is reduced by
+	// this amount so the entire cleanup completes before external process managers
+	// (systemd, Kubernetes) forcibly kill the agent.
+	ShutdownBuffer = process.KillReapTime + 2*time.Second
+
+	// ProcessStopTimeout is the maximum time to wait for a component to stop
+	// before escalating to SIGKILL. ShutdownBuffer time is removed from stop
+	// time so the process may be killed and reaped within this value. Value
+	// was chosen to reflect external process manager defaults (systemd: 90s,
+	// k8s: 30s, windows: 30s).
+	ProcessStopTimeout = 30 * time.Second
+
+	// minGraceTimeout is the minimum SIGTERM grace period when the configured
+	// stop timeout minus ShutdownBuffer would be zero or negative.
+	minGraceTimeout = 1 * time.Second
+)
 
 type MonitoringManager interface {
 	// EnrichArgs enriches arguments provided to application, in
@@ -187,40 +213,7 @@ func (c *commandRuntime) Run(ctx context.Context, comm Communicator) error {
 				c.sendObserved()
 			}
 		case checkin := <-comm.CheckinObserved():
-			sendExpected := false
-			changed := false
-			if c.state.State == client.UnitStateStarting {
-				// first observation after start set component to healthy
-				c.state.State = client.UnitStateHealthy
-				c.state.Message = fmt.Sprintf("Healthy: communicating with pid '%d'", c.proc.PID)
-				changed = true
-			}
-			if c.lastCheckin.IsZero() {
-				// first check-in
-				sendExpected = true
-			}
-			// Warning lastCheckin must contain a
-			// monotonic clock.  Functions like Local(),
-			// UTC(), Round(), AddDate(), etc. remove the
-			// monotonic clock.  See
-			// https://pkg.go.dev/time
-			c.lastCheckin = time.Now()
-			if c.state.syncCheckin(checkin) {
-				changed = true
-			}
-			if c.state.unsettled() {
-				sendExpected = true
-			}
-			if sendExpected {
-				checkinExpected := c.state.toCheckinExpected()
-				comm.CheckinExpected(checkinExpected, checkin)
-			}
-			if changed {
-				c.sendObserved()
-			}
-			if c.state.cleanupStopped() {
-				c.sendObserved()
-			}
+			c.processCheckin(checkin, comm)
 		case <-t.C:
 			t.Reset(checkinPeriod)
 			if c.actionState == actionStart {
@@ -351,18 +344,78 @@ func (c *commandRuntime) sendObserved() {
 	c.ch <- c.state.Copy()
 }
 
+// processCheckin handles an observed check-in message from the running process.
+func (c *commandRuntime) processCheckin(checkin *proto.CheckinObserved, comm Communicator) {
+	// Ignore late check-ins once the component is no longer meant to be
+	// running. The checkinObserved channel is unbuffered, so a final check-in
+	// emitted by a dying process can be parked on it while stop() blocks the
+	// Run() loop reaping the process, then delivered after stop() has already
+	// forced UnitStateStopped. Processing it would resurrect non-stopped unit
+	// states via syncCheckin and emit a state update after the terminal
+	// Stopped state, re-broadcasting stale health for a component that has
+	// been removed. This mirrors serviceRuntime's isRunning() guard in its
+	// own processCheckin.
+	if c.actionState != actionStart || c.state.State == client.UnitStateStopping || c.state.State == client.UnitStateStopped {
+		return
+	}
+	sendExpected := false
+	changed := false
+	if c.state.State == client.UnitStateStarting {
+		// first observation after start set component to healthy
+		c.state.State = client.UnitStateHealthy
+		c.state.Message = fmt.Sprintf("Healthy: communicating with pid '%d'", c.proc.PID)
+		changed = true
+	}
+	if c.lastCheckin.IsZero() {
+		// first check-in
+		sendExpected = true
+	}
+	// Warning lastCheckin must contain a
+	// monotonic clock.  Functions like Local(),
+	// UTC(), Round(), AddDate(), etc. remove the
+	// monotonic clock.  See
+	// https://pkg.go.dev/time
+	c.lastCheckin = time.Now()
+	if c.state.syncCheckin(checkin) {
+		changed = true
+	}
+	if c.state.unsettled() {
+		sendExpected = true
+	}
+	if sendExpected {
+		checkinExpected := c.state.toCheckinExpected()
+		comm.CheckinExpected(checkinExpected, checkin)
+	}
+	if changed {
+		c.sendObserved()
+	}
+	if c.state.cleanupStopped() {
+		c.sendObserved()
+	}
+}
+
 func (c *commandRuntime) start(comm Communicator) error {
 	if c.proc != nil {
 		// already running
 		return nil
 	}
 	cmdSpec := c.getCommandSpec()
-	env := make([]string, 0, len(cmdSpec.Env)+2)
+	env := make([]string, 0, len(cmdSpec.Env)+4)
 	for _, e := range cmdSpec.Env {
 		env = append(env, fmt.Sprintf("%s=%s", e.Name, e.Value))
 	}
 	env = append(env, fmt.Sprintf("%s=%s", envAgentComponentID, c.current.ID))
 	env = append(env, fmt.Sprintf("%s=%s", envAgentComponentType, c.getSpecType()))
+
+	// in case of agentless mode, propagate the agentless environment variables
+	if v, ok := os.LookupEnv(isAgentlessEnvName); ok {
+		env = append(env, fmt.Sprintf("%s=%s", isAgentlessEnvName, v))
+	}
+
+	if v, ok := os.LookupEnv(stateStoreInputTypesEnvName); ok {
+		env = append(env, fmt.Sprintf("%s=%s", stateStoreInputTypesEnvName, v))
+	}
+
 	workDir := c.current.WorkDirPath(paths.Run())
 	path, err := filepath.Abs(c.getSpecBinaryPath())
 	if err != nil {
@@ -385,10 +438,15 @@ func (c *commandRuntime) start(comm Communicator) error {
 	c.lastCheckin = time.Time{}
 	c.missedCheckins = 0
 
-	proc, err := process.Start(path,
+	startOpts := []process.StartOption{
 		process.WithArgs(args),
 		process.WithEnv(env),
-		process.WithCmdOptions(attachOutErr(c.logStd, c.logErr), dirPath(workDir)))
+		process.WithCmdOptions(attachOutErr(c.logStd, c.logErr), dirPath(workDir)),
+	}
+	if !process.HasConsole() {
+		startOpts = append(startOpts, process.WithNewConsole())
+	}
+	proc, err := process.Start(path, startOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to start process: %w", err)
 	}
@@ -414,25 +472,23 @@ func (c *commandRuntime) stop(ctx context.Context) error {
 
 	// cleanup reserved resources related to monitoring
 	defer c.monitor.Cleanup(c.current.ID) //nolint:errcheck // this is ok
-	cmdSpec := c.getCommandSpec()
-	go func(info *process.Info, timeout time.Duration) {
-		t := time.NewTimer(timeout)
-		defer t.Stop()
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			// kill no matter what (might already be stopped)
-			c.log.Debugf("timeout waiting for pid %d, killing it", c.proc.PID)
-			_ = info.Kill()
-		}
-	}(c.proc, cmdSpec.Timeouts.Stop)
 
 	c.log.Debugf("gracefully stopping pid %d", c.proc.PID)
+	_ = c.proc.Stop() // SIGTERM
 
-	if stopErr := c.proc.Stop(); stopErr != nil {
-		return fmt.Errorf("failed to stop process %s: %w", c.proc.Cmd.String(), stopErr)
+	// Block until the process is reaped. This guarantees no zombie is left
+	// behind, whether this is a normal policy-driven stop or a shutdown.
+	// While blocked, Run()'s select loop is paused in the actionStop case,
+	// so waitOrKill() is the sole reader of procCh — no deadlock.
+	ps := c.waitOrKill()
+
+	pid := c.proc.PID
+	c.proc = nil
+	exitCode := -1
+	if ps != nil {
+		exitCode = ps.ExitCode()
 	}
+	c.forceCompState(client.UnitStateStopped, fmt.Sprintf("Stopped: pid '%d' exited with code '%d'", pid, exitCode))
 	return nil
 }
 
@@ -455,6 +511,50 @@ func (c *commandRuntime) startWatcher(info *process.Info, comm Communicator) {
 			state: s,
 		}
 	}()
+}
+
+// waitOrKill waits for the process to exit after SIGTERM.
+// If the process does not exit within the grace period, it sends SIGKILL
+// to force termination. An unresponsive process should be killed and
+// reaped within ProcessStopTimeout.
+// Returns the process state from procCh, or nil if the reap timed out.
+func (c *commandRuntime) waitOrKill() *os.ProcessState {
+	stopTimeout := ProcessStopTimeout
+	if cmdSpec := c.getCommandSpec(); cmdSpec != nil && cmdSpec.Timeouts.Stop > 0 {
+		stopTimeout = cmdSpec.Timeouts.Stop
+	}
+
+	// Remove some time as a buffer for SIGKILL + overhead if unresponsive
+	graceTimeout := stopTimeout - ShutdownBuffer
+	if graceTimeout <= 0 {
+		graceTimeout = minGraceTimeout
+	}
+
+	// Wait for the process to exit gracefully
+	stopTimer := time.NewTimer(graceTimeout)
+	defer stopTimer.Stop()
+	select {
+	case ps := <-c.procCh:
+		c.log.Debugf("process %d reaped successfully during cleanup", c.proc.PID)
+		return ps.state
+	case <-stopTimer.C:
+		c.log.Warnf("process %d did not stop after %s, killing it", c.proc.PID, graceTimeout)
+	}
+
+	_ = c.proc.Kill() // SIGKILL
+
+	// Drain procCh so the startWatcher goroutine can complete and
+	// os.Process.Wait() reaps the child.
+	reapTimer := time.NewTimer(process.KillReapTime)
+	defer reapTimer.Stop()
+	select {
+	case ps := <-c.procCh:
+		c.log.Debugf("process %d reaped successfully after SIGKILL", c.proc.PID)
+		return ps.state
+	case <-reapTimer.C:
+		c.log.Errorf("timed out waiting for process %d to be reaped after SIGKILL", c.proc.PID)
+		return nil
+	}
 }
 
 func (c *commandRuntime) handleProc(state *os.ProcessState) bool {

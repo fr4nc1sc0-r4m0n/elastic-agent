@@ -39,8 +39,12 @@ type RuntimeManager string
 
 type RuntimeConfig struct {
 	Default       string            `yaml:"default" config:"default" json:"default"`
+	Auditbeat     BeatRuntimeConfig `yaml:"auditbeat" config:"auditbeat" json:"auditbeat"`
 	Filebeat      BeatRuntimeConfig `yaml:"filebeat" config:"filebeat" json:"filebeat"`
+	Heartbeat     BeatRuntimeConfig `yaml:"heartbeat" config:"heartbeat" json:"heartbeat"`
 	Metricbeat    BeatRuntimeConfig `yaml:"metricbeat" config:"metricbeat" json:"metricbeat"`
+	Osquerybeat   BeatRuntimeConfig `yaml:"osquerybeat" config:"osquerybeat" json:"osquerybeat"`
+	Packetbeat    BeatRuntimeConfig `yaml:"packetbeat" config:"packetbeat" json:"packetbeat"`
 	DynamicInputs string            `yaml:"dynamic_inputs" config:"dynamic_inputs" json:"dynamic_inputs"`
 	Output        map[string]string `yaml:"output" config:"output" json:"output"`
 }
@@ -54,23 +58,39 @@ func DefaultRuntimeConfig() *RuntimeConfig {
 	return &RuntimeConfig{
 		Default:       string(DefaultRuntimeManager),
 		DynamicInputs: string(ProcessRuntimeManager),
+		Auditbeat: BeatRuntimeConfig{
+			Default: string(OtelRuntimeManager),
+			// go-ucfg sets this while unpacking, having it in the default makes testing easier
+			InputType: make(map[string]string),
+		},
+		Filebeat: BeatRuntimeConfig{
+			Default: string(OtelRuntimeManager),
+			// go-ucfg sets this while unpacking, having it in the default makes testing easier
+			InputType: make(map[string]string),
+		},
+		Heartbeat: BeatRuntimeConfig{
+			Default: string(OtelRuntimeManager),
+			// go-ucfg sets this while unpacking, having it in the default makes testing easier
+			InputType: make(map[string]string),
+		},
 		Metricbeat: BeatRuntimeConfig{
 			Default:   string(OtelRuntimeManager),
 			InputType: map[string]string{},
 		},
-		Filebeat: BeatRuntimeConfig{
+		Osquerybeat: BeatRuntimeConfig{
 			// go-ucfg sets this while unpacking, having it in the default makes testing easier
 			InputType: make(map[string]string),
 		},
-		Output: map[string]string{
-			"logstash": string(ProcessRuntimeManager), // Force all inputs using the Logstash output to use the process runtime
-			"kafka":    string(ProcessRuntimeManager), // Force all inputs using the kafka output to use the process runtime
+		Packetbeat: BeatRuntimeConfig{
+			Default: string(OtelRuntimeManager),
+			// go-ucfg sets this while unpacking, having it in the default makes testing easier
+			InputType: make(map[string]string),
 		},
+		Output: map[string]string{},
 	}
 }
 
 func (r *RuntimeConfig) Validate() error {
-
 	validateRuntime := func(val string, allowEmpty bool) error {
 		if allowEmpty && val == "" {
 			return nil
@@ -86,7 +106,7 @@ func (r *RuntimeConfig) Validate() error {
 	if err := validateRuntime(r.Default, false); err != nil {
 		return err
 	}
-	for _, beatConfig := range []BeatRuntimeConfig{r.Filebeat, r.Metricbeat} {
+	for _, beatConfig := range []BeatRuntimeConfig{r.Auditbeat, r.Filebeat, r.Heartbeat, r.Metricbeat, r.Osquerybeat, r.Packetbeat} {
 		if err := validateRuntime(beatConfig.Default, true); err != nil {
 			return err
 		}
@@ -111,10 +131,18 @@ func (r *RuntimeConfig) Validate() error {
 
 func (r *RuntimeConfig) BeatRuntimeConfig(beatName string) *BeatRuntimeConfig {
 	switch beatName {
+	case "auditbeat":
+		return &r.Auditbeat
 	case "filebeat":
 		return &r.Filebeat
+	case "heartbeat":
+		return &r.Heartbeat
 	case "metricbeat":
 		return &r.Metricbeat
+	case "osquerybeat":
+		return &r.Osquerybeat
+	case "packetbeat":
+		return &r.Packetbeat
 	default:
 		return nil
 	}
@@ -375,6 +403,17 @@ func (c *Component) BeatName() string {
 		return c.InputSpec.BeatName()
 	}
 	return ""
+}
+
+// OutputUnit returns the first output unit among c.Units, if any.
+// Agent-built components normally have at most one output unit; if several are present, the first is returned.
+func (c *Component) OutputUnit() (Unit, bool) {
+	for _, u := range c.Units {
+		if u.Type == client.UnitTypeOutput {
+			return u, true
+		}
+	}
+	return Unit{}, false
 }
 
 // GetBeatInputIDForUnit returns the ID of the corresponding input or module in the beat configuration for the unit.

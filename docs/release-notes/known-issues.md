@@ -23,8 +23,104 @@ Known issues are significant defects or limitations that may impact your impleme
 % Workaround description.
 % :::
 
+:::{dropdown} {{agent}} logs a "failed to unmarshal checkin actions" error on almost every {{fleet}} check-in
+
+**Applies to: {{agent}} 8.19.17, 8.19.18, 9.3.6, 9.3.7, 9.4.3**
+
+On July 7, 2026, a known issue was discovered where {{fleet}}-managed {{agents}} log an error on nearly every check-in when there is nothing new for {{fleet}} to tell them to do:
+
+```
+failed to unmarshal checkin actions: unexpected end of JSON input
+```
+
+This is a cosmetic logging issue only. Actions are still delivered and processed normally whenever {{fleet}} does send any. Nothing about how the agent actually operates is affected, and no action is required — the error can be safely ignored.
+
+For more information, check [Issue #15397](https://github.com/elastic/elastic-agent/issues/15397).
+:::
+
+:::{dropdown} [Windows] {{agent}} fails to upgrade when the host has 100 or more installed programs
+
+**Applies to: {{agent}} 9.4.0, 9.4.1, 9.4.2 (Windows only)**
+
+On June 4, 2026, a known issue was discovered where upgrading {{agent}} from a pre-9.4.0 version on a Windows host with 100 or more entries in Add/Remove Programs causes the new agent to hang indefinitely during startup. The Upgrade Watcher detects the hang and rolls back the upgrade.
+
+To check the number of entries on a host, run the following command in PowerShell:
+
+```powershell
+(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall').Count
+```
+
+If the count is more than 100, upgrade directly to a version that is not affected by this issue.
+
+For more information, check [Issue #14764](https://github.com/elastic/elastic-agent/issues/14764).
+:::
+
+:::{dropdown} Missing APM service_destination metrics and empty service map in the APM UI
+
+**Applies to: {{agent}} 9.2.6, 9.2.7, 9.3.1, 9.3.2**
+
+On June 17, 2026, a known issue was discovered where the aggregated `service_destination` metric that the APM UI uses can be missing from the `metrics/aggregated-otel-metrics` EDOT Collector pipeline, even when trace traffic is present and other telemetry paths appear healthy. As a result, the APM service map appears empty.
+
+The issue occurs when two EDOT components, `elasticapmprocessor` and `elasticapmconnector`, are both at v0.29.0, which is the version bundled with the affected {{agent}} releases.
+
+**Resolution**
+
+This issue is fixed in {{agent}} 9.2.8 and 9.3.3, which include updated versions of these components.
+
+For more information, check [Issue #14964](https://github.com/elastic/elastic-agent/issues/14964).
+:::
+
+:::{dropdown} Elastic Agent reports policy is outdated when agent.features.disable_policy_change_acks is enabled.
+**Applies to: {{agent}} 9.4.0, 9.3.4, 9.3.3, 9.3.2, 9.3.1, 9.3.0, 9.2.7, 9.2.6, 9.2.5, 9.2.4, 9.2.3, 9.2.2, 9.2.1, 9.2.0**
+
+On April 22, 2026 a known issue was discovered that prevents {{fleet}}-managed {{agents}} from correctly reporting their policy information when policy change acknowledgements are disabled.
+
+Users see an outdated policy warning on the {{fleet}} UI when policy change acknowledgments are disabled and a policy update is sent.
+
+**Workaround:**
+
+Affected users can uncheck the **Disable policy change acknowledgments** option within the agent policy settings in the Fleet UI.
+
+For more information check [Issue #264983](https://github.com/elastic/kibana/issues/264983).
+:::
+
+::::{dropdown} Events from Beats-based inputs and integrations in Elastic Agent 9.3.4 incorrectly convert timestamps to an empty {} JSON object.
+:name: events-beats-9-3-4-timestamp-empty-object
+**Applies to: {{agent}} 9.3.4**
+
+:::{warning}
+Due to the broad impact of this issue, {{agent}} 9.3.4 has been removed from the downloads page. We recommend upgrading directly to {{agent}} 9.3.5 or later.
+:::
+
+A performance optimization in {{agent}} 9.3.4 causes timestamp fields produced by Beats-based inputs to be incorrectly serialized as an empty `{}` JSON object. This affects time fields in the event body (for example, `event.created`) but does not affect the primary `@timestamp` field.
+
+**Impact**
+
+Because most {{agent}} integrations and inputs rely on Beats-based collectors, the impact is wide-ranging. Examples of affected functionality include:
+
+* **Synthetics monitoring** — Synthetics monitors rely on Heartbeat and might stop reporting expected data, resulting in a loss of monitoring visibility.
+* **SentinelOne integration** — Response actions stop functioning when `event.created` is missing. For details, refer to [Issue #266355](https://github.com/elastic/kibana/issues/266355).
+* **Other data-collection integrations** — Any integration that sends events through Beats-based inputs may emit affected documents.
+
+**Symptoms**
+
+Documents from Beats-based inputs contain one or more time fields serialized as an empty object, for example:
+
+```json
+"event": {
+  "dataset": "sentinel_one.agent",
+  "created": {}
+}
+```
+
+**Resolution**
+
+The performance optimization has been removed. The fix is included in {{agent}} 9.3.5. This issue does not affect {{agent}} 9.4.0.
+::::
+
 :::{dropdown} Elastic Agent 9.3.x fails to start on MacOS when OSQuery Manager integration is used
-**Applies to: {{agent}} 9.3.0 9.3.1**
+**Applies to: {{agent}} 9.3.0, 9.3.1**
+
 On March 5, 2026, a known issue was discovered that prevents {{agent}} 9.3.0 and above from starting when:
 - {{agent}} is installed on MacOS.
 - The OSQuery Manager integration is installed.
@@ -138,9 +234,10 @@ This issue is triggered if the upgrade fails during one of the early checks insi
 Restart the {{agent}} to clear the coordinator’s `overrideState` and allow new upgrade attempts to proceed.
 
 **Resolution**
+
 This issue was fixed in [#9992](https://github.com/elastic/elastic-agent/pull/9992), which ensures that the coordinator clears its override state whenever an early failure occurs.
 
-The fix is included in versions 9.1.4 and 8.19.4, and planned for versions 9.0.8 and 8.18.8.
+The fix is included in versions 9.1.4, 9.0.8, 8.19.4, and 8.18.8.
 :::
 
 :::{dropdown} [Windows] {{agent}} does not process Windows security events
@@ -151,9 +248,9 @@ On August 1, 2025, a known issue was discovered where {{agent}} does not process
 
 For more information, check [Issue #45693](https://github.com/elastic/beats/issues/45693).
 
-**Workaround**
+**Resolution**
 
-No workaround is available at the moment, but a fix is expected to be available in {{agent}} 8.19.1 and 9.1.1.
+This issue was fixed in [#45730](https://github.com/elastic/beats/pull/45730). The fix is included in {{agent}} 9.1.1 and 8.19.1.
 :::
 
 :::{dropdown} {{agents}} remain in an "Upgrade scheduled" state

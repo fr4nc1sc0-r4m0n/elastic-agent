@@ -155,7 +155,7 @@ func TestFleetUpgradeToPRBuild(t *testing.T) {
 		Local: false,
 	})
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// ========================= prepare from fixture ==========================
 	versions, err := upgradetest.GetUpgradableVersions()
@@ -283,8 +283,9 @@ func TestFleetUpgradeToPRBuild(t *testing.T) {
 }
 
 func testFleetAirGappedUpgrade(t *testing.T, stack *define.Info, unprivileged bool) {
-	ctx, _ := testcontext.WithDeadline(
-		t, context.Background(), time.Now().Add(10*time.Minute))
+	ctx, cancel := testcontext.WithDeadline(
+		t, t.Context(), time.Now().Add(10*time.Minute))
+	defer cancel()
 
 	latest := define.Version()
 
@@ -765,7 +766,12 @@ func copyFile(t *testing.T, srcPath, dstPath string) {
 	require.NoError(t, err, "Failed to sync dst file")
 }
 
-func isFIPSCapableVersion(ver *version.ParsedSemVer) bool {
+func isFIPSCapableVersion(ver *version.ParsedSemVer, os, arch string) bool {
+	// None of the released Windows versions are FIPS capable
+	if os == "windows" {
+		return false
+	}
+
 	// The 8.19.x versions are FIPS-capable
 	if ver.Major() == 8 && ver.Minor() == 19 {
 		return true
