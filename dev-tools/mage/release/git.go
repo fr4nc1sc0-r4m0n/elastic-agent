@@ -42,6 +42,7 @@ func (g *GitRepo) CreateBranch(branchName string) error {
 	if err == nil {
 		err = w.Checkout(&git.CheckoutOptions{
 			Branch: refName,
+			Keep:   true,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to checkout existing branch: %w", err)
@@ -68,9 +69,11 @@ func (g *GitRepo) CreateBranch(branchName string) error {
 		return fmt.Errorf("failed to create branch: %w", err)
 	}
 
-	// Checkout the new branch
+	// Checkout the new branch, keeping local changes so release file updates
+	// prepared before branch creation can be committed on the release branch.
 	err = w.Checkout(&git.CheckoutOptions{
 		Branch: refName,
+		Keep:   true,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to checkout branch: %w", err)
@@ -80,31 +83,34 @@ func (g *GitRepo) CreateBranch(branchName string) error {
 	return nil
 }
 
-// CommitAll commits all changes with the given message
+// CommitAll commits all changes with the given message.
 func (g *GitRepo) CommitAll(message, authorName, authorEmail string) error {
 	w, err := g.repo.Worktree()
 	if err != nil {
 		return fmt.Errorf("failed to get worktree: %w", err)
 	}
 
-	// Add all changes
-	err = w.AddWithOptions(&git.AddOptions{
-		All: true,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to add changes: %w", err)
-	}
-
 	status, err := w.Status()
 	if err != nil {
 		return fmt.Errorf("failed to get worktree status: %w", err)
 	}
-	if status.IsClean() {
+
+	hasChanges := false
+	for path, fileStatus := range status {
+		if fileStatus.Worktree == git.Unmodified && fileStatus.Staging == git.Unmodified {
+			continue
+		}
+
+		hasChanges = true
+		if _, err := w.Add(path); err != nil {
+			return fmt.Errorf("failed to add %s: %w", path, err)
+		}
+	}
+	if !hasChanges {
 		fmt.Println("  No changes to commit")
 		return nil
 	}
 
-	// Create commit
 	commit, err := w.Commit(message, &git.CommitOptions{
 		Author: &object.Signature{
 			Name:  authorName,
